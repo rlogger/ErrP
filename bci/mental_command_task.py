@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import pickle
 import random
 from collections import Counter
@@ -16,7 +17,6 @@ from config import (
     MentalCommandLabelConfig,
     MentalCommandModelConfig,
     MentalCommandTaskConfig,
-    SessionConfig,
 )
 from mental_command_worker import (
     EMAProbSmoother,
@@ -27,10 +27,9 @@ from mental_command_worker import (
 )
 
 
-def run_task():
+def run_task(fname: str):
     lsl_cfg = LSLConfig()
     eeg_cfg = EEGConfig()
-    sess_cfg = SessionConfig()
     label_cfg = MentalCommandLabelConfig()
     task_cfg = MentalCommandTaskConfig()
     model_cfg = MentalCommandModelConfig()
@@ -66,7 +65,7 @@ def run_task():
     ch_names = list(stream.info["ch_names"])
     print(f"[LSL] Connected: sfreq={sfreq:.1f} Hz, channels={ch_names}")
 
-    raw_csv_path = f"{sess_cfg.name}_mental_command_raw.csv"
+    raw_csv_path = f"{fname}_mental_command_raw.csv"
     raw_recorder = RawCSVRecorder(filepath=raw_csv_path, ch_names=ch_names)
     raw_recorder.start()
 
@@ -267,9 +266,9 @@ def run_task():
             n_classes=len(classifier.named_steps["clf"].classes_),
         )
 
-        np.save(f"{sess_cfg.name}_mental_command_windows.npy", X_train)
-        np.save(f"{sess_cfg.name}_mental_command_labels.npy", y_train)
-        with open(f"{sess_cfg.name}_mental_command_model.pkl", "wb") as fh:
+        np.save(f"{fname}_mental_command_windows.npy", X_train)
+        np.save(f"{fname}_mental_command_labels.npy", y_train)
+        with open(f"{fname}_mental_command_model.pkl", "wb") as fh:
             pickle.dump(classifier, fh)
 
         cue.text = (
@@ -434,4 +433,11 @@ def run_task():
 
 
 if __name__ == "__main__":
-    run_task()
+    parser = argparse.ArgumentParser(description="Run mental command training/live task.")
+    parser.add_argument(
+        "--fname",
+        required=True,
+        help="Base filename for all saved session artifacts (without extension).",
+    )
+    args = parser.parse_args()
+    run_task(fname=args.fname)

@@ -6,6 +6,7 @@
 # The raw CSV captures EEG + TRG so every event marker is preserved.
 from __future__ import annotations
 
+import argparse
 import random
 import time
 import serial
@@ -113,7 +114,7 @@ _ARROW_VERTS_LEFT = [(-x, y) for x, y in _ARROW_VERTS_RIGHT]
 # ----------------------------------------------------------------
 
 
-def run_task():
+def run_task(fname: str):
     # ---- Configuration ----
     lsl_cfg = LSLConfig()
     eeg_cfg = EEGConfig()
@@ -191,7 +192,7 @@ def run_task():
     trig.open()
 
     # ---- Raw CSV recorder (EEG + TRG) ----
-    raw_csv_path = f"{session_cfg.name}{session_cfg.raw_csv_suffix}"
+    raw_csv_path = f"{fname}{session_cfg.raw_csv_suffix}"
     raw_recorder = RawCSVRecorder(filepath=raw_csv_path, ch_names=ch_names)
     raw_recorder.start()
 
@@ -587,9 +588,9 @@ def run_task():
         if len(y_all) > 0:
             X_save = np.stack(X_all, axis=0)
             y_save = np.array(y_all, dtype=int)
-            np.save(f"{session_cfg.name}_data.npy", X_save)
-            np.save(f"{session_cfg.name}_labels.npy", y_save)
-            print(f"[SAVE] {X_save.shape[0]} epochs -> {session_cfg.name}_data.npy")
+            np.save(f"{fname}_data.npy", X_save)
+            np.save(f"{fname}_labels.npy", y_save)
+            print(f"[SAVE] {X_save.shape[0]} epochs -> {fname}_data.npy")
 
             cv_mean, cv_std, cv_scores = run_cv(X_save, y_save, model_cfg, fixed_C=best_C)
             if len(cv_scores) > 0:
@@ -608,7 +609,14 @@ def run_task():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run motor-imagery BCI PsychoPy task.")
+    parser.add_argument(
+        "--fname",
+        required=True,
+        help="Base filename for all saved session artifacts (without extension).",
+    )
+    args = parser.parse_args()
     try:
-        run_task()
+        run_task(fname=args.fname)
     except KeyboardInterrupt:
         pass

@@ -88,8 +88,6 @@ class SerialConfig:
 
 @dataclass(frozen=True)
 class SessionConfig:
-    name: str = "session_1"  # base filename for saved data
-
     # Raw stream capture during full session (calibration + online)
     raw_csv_suffix: str = "_raw.csv"
 
