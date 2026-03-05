@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from mne.filter import filter_data, notch_filter
 from pyriemann.estimation import Covariances
 from pyriemann.tangentspace import TangentSpace
+from scipy.signal import butter, iirnotch, sosfilt, sosfilt_zi, tf2sos
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
@@ -19,27 +19,81 @@ from config import EEGConfig, MentalCommandModelConfig
 # Filtering
 # ---------------------------------------------------------------------------
 
-def filter_block(block: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray:
-    """Wide bandpass + optional notch for a continuous segment.
-
-    Uses IIR (4th-order Butterworth, zero-phase) so that edge effects are
-    negligible even on segments as short as ~2-3 s.
-
-    block shape: (n_ch, n_samples).
-    """
-    Xf = np.asarray(block, dtype=np.float64, order="C")
-    if eeg_cfg.notch is not None:
-        Xf = notch_filter(Xf, Fs=sfreq, freqs=[float(eeg_cfg.notch)], verbose="ERROR")
-    Xf = filter_data(
-        Xf,
-        sfreq=float(sfreq),
-        l_freq=float(eeg_cfg.l_freq),
-        h_freq=float(eeg_cfg.h_freq),
-        method="iir",
-        iir_params=dict(order=4, ftype="butter", output="sos"),
-        verbose="ERROR",
+def _build_sos_bandpass(sfreq: float, lo: float, hi: float, order: int = 4) -> np.ndarray:
+    return butter(
+        int(order),
+        [float(lo), float(hi)],
+        btype="bandpass",
+        output="sos",
+        fs=float(sfreq),
     )
-    return Xf.astype(np.float32, copy=False)
+
+
+def _build_sos_notch(sfreq: float, freq: float, q: float = 30.0) -> np.ndarray:
+    b, a = iirnotch(w0=float(freq), Q=float(q), fs=float(sfreq))
+    return tf2sos(b, a)
+
+
+def _build_wideband_sos(eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray:
+    stages = []
+    if eeg_cfg.notch is not None:
+        stages.append(_build_sos_notch(sfreq, float(eeg_cfg.notch)))
+    stages.append(_build_sos_bandpass(sfreq, eeg_cfg.l_freq, eeg_cfg.h_freq, order=4))
+    return np.vstack(stages).astype(np.float64, copy=False)
+
+
+class StreamingIIRFilter:
+    """Channel-wise causal SOS filter with persistent per-channel state."""
+
+    def __init__(self, sos: np.ndarray, n_channels: int):
+        sos = np.asarray(sos, dtype=np.float64)
+        if sos.ndim != 2 or sos.shape[1] != 6:
+            raise ValueError(f"Expected SOS shape (n_sections, 6), got {sos.shape}")
+        self.sos = sos
+        self.n_channels = int(n_channels)
+        self._zi_template = sosfilt_zi(self.sos).astype(np.float64, copy=False)
+        self.reset()
+
+    @classmethod
+    def from_eeg_config(cls, eeg_cfg: EEGConfig, sfreq: float, n_channels: int) -> "StreamingIIRFilter":
+        return cls(_build_wideband_sos(eeg_cfg=eeg_cfg, sfreq=sfreq), n_channels=n_channels)
+
+    def reset(self):
+        self._zi = np.zeros((self.n_channels,) + self._zi_template.shape, dtype=np.float64)
+        self._primed = np.zeros(self.n_channels, dtype=bool)
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        X = np.asarray(chunk, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] != self.n_channels:
+            raise ValueError(
+                f"Expected chunk shape ({self.n_channels}, n_samples), got {X.shape}"
+            )
+        n_samples = int(X.shape[1])
+        if n_samples == 0:
+            return np.empty_like(X, dtype=np.float32)
+
+        Y = np.empty_like(X, dtype=np.float64)
+        for ch in range(self.n_channels):
+            x = X[ch]
+            zi = self._zi[ch]
+            if not self._primed[ch]:
+                zi = self._zi_template * float(x[0])
+                self._primed[ch] = True
+            y, zf = sosfilt(self.sos, x, zi=zi)
+            self._zi[ch] = zf
+            Y[ch] = y
+        return Y.astype(np.float32, copy=False)
+
+
+def filter_block(block: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray:
+    """Causal wideband filtering for one continuous block."""
+    X = np.asarray(block, dtype=np.float32, order="C")
+    if X.ndim != 2:
+        raise ValueError(f"Expected 2-D block (n_ch, n_samples), got {X.shape}")
+    filt = StreamingIIRFilter.from_eeg_config(
+        eeg_cfg=eeg_cfg, sfreq=float(sfreq), n_channels=int(X.shape[0])
+    )
+    return filt.process(X)
 
 
 # ---------------------------------------------------------------------------
@@ -76,24 +130,19 @@ def split_windows(
 # ---------------------------------------------------------------------------
 
 def _iir_bandpass(X: np.ndarray, sfreq: float, lo: float, hi: float) -> np.ndarray:
-    """Zero-phase IIR bandpass on an (n_windows, n_ch, n_samples) array.
-
-    Reshapes to 2-D so that ``mne.filter.filter_data`` always receives a
-    simple (rows, time) matrix — guaranteed safe for the IIR path.
-    """
+    """Causal IIR bandpass on an (n_windows, n_ch, n_samples) array."""
     X64 = np.asarray(X, dtype=np.float64)
     orig_shape = X64.shape
     if X64.ndim == 3:
         X64 = X64.reshape(-1, orig_shape[-1])
-    filtered = filter_data(
-        X64,
-        sfreq=float(sfreq),
-        l_freq=float(lo),
-        h_freq=float(hi),
-        method="iir",
-        iir_params=dict(order=4, ftype="butter", output="sos"),
-        verbose="ERROR",
-    )
+    sos = _build_sos_bandpass(sfreq=float(sfreq), lo=float(lo), hi=float(hi), order=4)
+    zi_template = sosfilt_zi(sos).astype(np.float64, copy=False)
+    filtered = np.empty_like(X64, dtype=np.float64)
+    for i in range(X64.shape[0]):
+        x = X64[i]
+        zi = zi_template * float(x[0])
+        y, _ = sosfilt(sos, x, zi=zi)
+        filtered[i] = y
     return filtered.reshape(orig_shape).astype(np.float32, copy=False)
 
 
@@ -211,9 +260,8 @@ def evaluate_cv_quality(
     y: np.ndarray,
     block_ids: np.ndarray,
     pipeline: Pipeline,
-    cv_splits_max: int,
 ) -> MCQuality:
-    """Block-grouped cross-validation (one registration block held out per class per fold)."""
+    """LOGO-by-block-triplet CV (leave one neutral/c1/c2 block-group out)."""
     y = np.asarray(y, dtype=int)
     block_ids = np.asarray(block_ids, dtype=int)
     if y.shape[0] != X.shape[0] or block_ids.shape[0] != X.shape[0]:
@@ -225,27 +273,41 @@ def evaluate_cv_quality(
         class_mask = y == int(c)
         class_block_ids[int(c)] = np.sort(np.unique(block_ids[class_mask]))
 
-    min_block_count = min(len(v) for v in class_block_ids.values())
-    n_splits = min(int(cv_splits_max), int(min_block_count))
+    ref_block_ids = class_block_ids[int(classes[0])]
+    for c in classes[1:]:
+        if not np.array_equal(class_block_ids[int(c)], ref_block_ids):
+            block_counts = {int(k): class_block_ids[int(k)].tolist() for k in classes}
+            raise ValueError(
+                "Per-class block ids do not align for triplet-LOGO CV: "
+                f"{block_counts}"
+            )
+
+    n_splits = int(len(ref_block_ids))
     if n_splits < 2:
         block_counts = {int(c): len(class_block_ids[int(c)]) for c in classes}
         raise ValueError(
             f"Not enough registration blocks for grouped CV: per-class blocks={block_counts}"
         )
 
-    y_pred = np.empty_like(y)
-    for k in range(n_splits):
-        test_mask = np.zeros(y.shape[0], dtype=bool)
-        for c in classes:
-            held_out_block = class_block_ids[int(c)][k]
-            test_mask |= (y == int(c)) & (block_ids == int(held_out_block))
+    y_pred = np.full_like(y, fill_value=-1)
+    for held_out_block in ref_block_ids:
+        test_mask = block_ids == int(held_out_block)
         train_mask = ~test_mask
         if not np.any(test_mask) or not np.any(train_mask):
-            raise ValueError(f"Invalid CV split at fold {k}")
+            raise ValueError(f"Invalid CV split at held-out block {int(held_out_block)}")
+
+        test_classes = np.unique(y[test_mask])
+        if len(test_classes) != len(classes):
+            raise ValueError(
+                f"Held-out block {int(held_out_block)} missing classes: present={test_classes}, expected={classes}"
+            )
 
         fold_clf = clone(pipeline)
         fold_clf.fit(X[train_mask], y[train_mask])
         y_pred[test_mask] = fold_clf.predict(X[test_mask])
+
+    if np.any(y_pred < 0):
+        raise RuntimeError("CV prediction vector contains unassigned samples")
 
     cm = confusion_matrix(y, y_pred, labels=classes)
     denom = np.sum(cm, axis=1)

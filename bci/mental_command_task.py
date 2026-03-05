@@ -19,6 +19,7 @@ from config import (
 )
 from mental_command_worker import (
     EMAProbSmoother,
+    StreamingIIRFilter,
     evaluate_cv_quality,
     filter_block,
     make_bandpower_classifier,
@@ -208,28 +209,29 @@ def run_task(fname: str):
         update_bar(0.0, 0.0, 1.0)
         wait_for_space()
 
-        class_plan = [
-            (code_neutral, "Neutral", int(task_cfg.n_register_neutral)),
-            (code_c1, label_cfg.command1_name, int(task_cfg.n_register_command)),
-            (code_c2, label_cfg.command2_name, int(task_cfg.n_register_command)),
+        class_sequence = [
+            (code_neutral, "Neutral"),
+            (code_c1, label_cfg.command1_name),
+            (code_c2, label_cfg.command2_name),
         ]
-        for class_idx, (code, class_name, n_blocks) in enumerate(class_plan):
-            cue.text = (
-                f"Calibration target: {class_name}\n\n"
-                f"You will complete {n_blocks} accepted blocks.\n"
-                "Press SPACE when ready to start this target."
-            )
-            status.text = f"Each block is {task_cfg.register_duration_s:.0f}s, then you choose accept or redo."
-            detected.text = ""
-            update_bar(0.0, 0.0, 1.0)
-            wait_for_space()
+        n_triplets = int(task_cfg.n_register_blocks)
+        cue.text = (
+            "Calibration sequence\n\n"
+            f"{n_triplets} cycles of: Neutral -> {label_cfg.command1_name} -> {label_cfg.command2_name}\n"
+            "Press SPACE to start."
+        )
+        status.text = f"Each block is {task_cfg.register_duration_s:.0f}s, then you choose accept or redo."
+        detected.text = ""
+        update_bar(0.0, 0.0, 1.0)
+        wait_for_space()
 
-            for block_num in range(1, n_blocks + 1):
-                trial_block_id = block_num - 1
+        for block_num in range(1, n_triplets + 1):
+            trial_block_id = block_num - 1
+            for seq_idx, (code, class_name) in enumerate(class_sequence):
                 attempt = 0
                 while True:
                     attempt += 1
-                    cue.text = f"{class_name} block {block_num}/{n_blocks}"
+                    cue.text = f"Cycle {block_num}/{n_triplets}: {class_name}"
                     status.text = "Press SPACE to start this block."
                     detected.text = f"Attempt {attempt}"
                     update_bar(0.0, 0.0, 1.0)
@@ -246,7 +248,7 @@ def run_task(fname: str):
 
                     if raw_block.shape[1] < w_samples:
                         print(
-                            f"[REG] {class_name} block {block_num} attempt {attempt}: "
+                            f"[REG] {class_name} cycle {block_num} attempt {attempt}: "
                             f"not enough data ({raw_block.shape[1]} samples), retrying"
                         )
                         cue.text = f"{class_name} block too short"
@@ -256,8 +258,7 @@ def run_task(fname: str):
                         wait_for_space()
                         continue
 
-                    # Filter the entire block, THEN split into windows
-                    # (avoids FIR/IIR edge effects on short windows).
+                    # Filter the entire block continuously, THEN split into windows.
                     filtered_block = filter_block(raw_block, eeg_cfg, sfreq)
                     windows = split_windows(
                         block=filtered_block,
@@ -290,8 +291,7 @@ def run_task(fname: str):
                         wait_for_space()
                         continue
 
-                    # Show rejection stats and let user decide
-                    cue.text = f"Review block: {class_name} {block_num}/{n_blocks}"
+                    cue.text = f"Review: cycle {block_num}/{n_triplets} {class_name}"
                     status.text = (
                         f"{len(block_windows)} usable, {n_rejected} artifact-rejected, {n_total} total\n"
                         "SPACE = accept block, R = reject and redo"
@@ -301,9 +301,9 @@ def run_task(fname: str):
                     is_accepted = wait_for_block_decision()
                     if not is_accepted:
                         print(
-                            f"[REG] {class_name} block {block_num} attempt {attempt}: user rejected"
+                            f"[REG] {class_name} cycle {block_num} attempt {attempt}: user rejected"
                         )
-                        cue.text = f"Redo: {class_name} block {block_num}/{n_blocks}"
+                        cue.text = f"Redo: cycle {block_num}/{n_triplets} {class_name}"
                         status.text = "Press SPACE when ready to record again."
                         detected.text = ""
                         update_bar(0.0, 0.0, 1.0)
@@ -315,25 +315,17 @@ def run_task(fname: str):
                         model_labels.append(int(code))
                         model_block_ids.append(trial_block_id)
                     print(
-                        f"[REG] Accepted {class_name} block {block_num}/{n_blocks}: "
+                        f"[REG] Accepted {class_name} cycle {block_num}/{n_triplets}: "
                         f"{len(block_windows)} usable, {n_rejected} rejected (attempt {attempt})"
                     )
                     break
 
-                if block_num < n_blocks:
-                    cue.text = f"{class_name} block {block_num}/{n_blocks} accepted"
+                if not (block_num == n_triplets and seq_idx == len(class_sequence) - 1):
+                    cue.text = f"Accepted: cycle {block_num}/{n_triplets} {class_name}"
                     status.text = "Press SPACE when ready for the next block."
                     detected.text = ""
                     update_bar(0.0, 0.0, 1.0)
                     wait_for_space()
-
-            if class_idx < (len(class_plan) - 1):
-                next_name = class_plan[class_idx + 1][1]
-                cue.text = f"{class_name} calibration complete"
-                status.text = f"Next target: {next_name}\nPress SPACE to continue."
-                detected.text = ""
-                update_bar(0.0, 0.0, 1.0)
-                wait_for_space()
 
         # ==============================================================
         # Model training — evaluate both pipelines, pick the better one
@@ -362,10 +354,10 @@ def run_task(fname: str):
         bp_pipe = make_bandpower_classifier(model_cfg, sfreq)
 
         fb_quality = evaluate_cv_quality(
-            X_train, y_train, block_ids, fb_pipe, model_cfg.cv_splits_max,
+            X_train, y_train, block_ids, fb_pipe,
         )
         bp_quality = evaluate_cv_quality(
-            X_train, y_train, block_ids, bp_pipe, model_cfg.cv_splits_max,
+            X_train, y_train, block_ids, bp_pipe,
         )
 
         if fb_quality.balanced_accuracy >= bp_quality.balanced_accuracy:
@@ -427,10 +419,12 @@ def run_task(fname: str):
         session_clock = core.Clock()
         p_vec = np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float64)
 
-        # Live window: grab extra context for clean wide-bandpass filtering,
-        # then crop to the analysis window before passing to the classifier.
-        live_total_s = task_cfg.train_window_s + task_cfg.live_filter_context_s
-        live_total_n = int(round(live_total_s * sfreq))
+        live_filter = StreamingIIRFilter.from_eeg_config(
+            eeg_cfg=eeg_cfg, sfreq=sfreq, n_channels=len(ch_names)
+        )
+        live_buffer = np.empty((len(ch_names), 0), dtype=np.float32)
+        live_buffer_keep_n = int(round((task_cfg.train_window_s + task_cfg.live_filter_context_s) * sfreq))
+        stream_pull_s = max(0.20, task_cfg.live_update_interval_s * 2.0)
         last_live_ts: float | None = None
 
         while session_clock.getTime() < task_cfg.live_duration_s:
@@ -445,18 +439,27 @@ def run_task(fname: str):
             elif "0" in keys:
                 target_text = "Target: Neutral"
 
+            data, ts = stream.get_data(winsize=stream_pull_s, picks="all")
+            if data.size > 0 and ts is not None and len(ts) > 0:
+                ts = np.asarray(ts)
+                if last_live_ts is None:
+                    mask = np.ones_like(ts, dtype=bool)
+                else:
+                    mask = ts > float(last_live_ts)
+                if np.any(mask):
+                    x_new = np.asarray(data[:, mask], dtype=np.float32)
+                    last_live_ts = float(ts[mask][-1])
+                    x_new_filt = live_filter.process(x_new)
+                    live_buffer = np.concatenate((live_buffer, x_new_filt), axis=1)
+                    if live_buffer.shape[1] > live_buffer_keep_n:
+                        live_buffer = live_buffer[:, -live_buffer_keep_n:]
+
             if pred_clock.getTime() >= task_cfg.live_update_interval_s:
                 pred_clock.reset()
-                data, ts = stream.get_data(winsize=live_total_s, picks="all")
-                if data.size > 0 and data.shape[1] >= live_total_n:
-                    cur_ts = float(ts[-1]) if ts is not None and len(ts) > 0 else None
-                    if cur_ts is not None and (last_live_ts is None or cur_ts > last_live_ts):
-                        last_live_ts = cur_ts
-                        chunk = np.asarray(data[:, -live_total_n:], dtype=np.float32)
-                        chunk_filtered = filter_block(chunk, eeg_cfg, sfreq)
-                        x_win = chunk_filtered[:, -w_samples:]
-                        p_raw = classifier.predict_proba(x_win[np.newaxis, ...])[0]
-                        p_vec = smoother.update(p_raw)
+                if live_buffer.shape[1] >= w_samples:
+                    x_win = live_buffer[:, -w_samples:]
+                    p_raw = classifier.predict_proba(x_win[np.newaxis, ...])[0]
+                    p_vec = smoother.update(p_raw)
 
             left_p = p_vec[class_index[code_c1]]
             right_p = p_vec[class_index[code_c2]]

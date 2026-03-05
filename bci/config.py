@@ -127,9 +127,9 @@ class MentalCommandTaskConfig:
     rest_duration_s: float = 3.0
     prep_duration_s: float = 1.5
 
-    # Repetitions per class for registration.
-    n_register_neutral: int = 6
-    n_register_command: int = 6
+    # Number of calibration cycles.
+    # Each cycle records: Neutral -> Command1 -> Command2.
+    n_register_blocks: int = 6
 
     # Sliding-window extraction from registration blocks.
     train_window_s: float = 2.0
@@ -154,8 +154,7 @@ class MentalCommandModelConfig:
     max_iter: int = 1500
     class_weight: str | None = "balanced"
 
-    # Basic CV quality gate before live mode.
-    cv_splits_max: int = 5
+    # Minimum windows per class required before LOGO-by-block-triplet CV.
     min_per_class_for_cv: int = 4
 
     # Filter-bank sub-band definitions (lo_hz, hi_hz).
