@@ -36,9 +36,10 @@ class EEGConfig:
     picks: tuple[str, ...] = ("Pz", "F4", "C4", "P4", "P3", "C3", "F3")
     #picks: tuple[str, ...] = ("C4", "C3")
 
-    # Real-time filtering (stream-level)
-    l_freq: float = 8.0  # MI mu/beta emphasis
-    h_freq: float = 30.0
+    # Wide bandpass pre-filter (DC removal + anti-aliasing).
+    # Sub-band decomposition is handled inside the classifier pipeline.
+    l_freq: float = 1.0
+    h_freq: float = 45.0
     notch: float | None = None  # set None if not desired
 
     # Online epoching window (motor imagery)
@@ -48,26 +49,40 @@ class EEGConfig:
     # Baseline correction (optional; keep None for pure MI windows)
     baseline: tuple[float | None, float | None] | None = None
 
-    # Artifact rejection: max peak-to-peak amplitude in Volts; None to disable
-    reject_peak_to_peak: float | None = None
+    # Artifact rejection: max peak-to-peak amplitude in stream units (µV for DSI).
+    # Applied per-window after wide bandpass filtering.
+    reject_peak_to_peak: float | None = 150.0
 
 
 @dataclass(frozen=True)
 class CalibrationConfig:
     # Number of initial normal trials to use for calibration (no feedback).
-    n_calibration_trials: int = 100
+    n_calibration_trials: int = 80
     # Maximum calibration trials in a row before a mandatory break.
-    max_trials_before_break: int = 25
+    max_trials_before_break: int = 20
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    # Retrain every N new accepted epochs
-    retrain_every: int = 20
+    # Balanced scheduler block size for online trials.
+    retrain_every: int = 8
 
-    use_riemann: bool = True  # if False, use CSP+LR; if True, use Riemannian geometry approach
-    # CSP configuration
-    n_csp_components: int = 6
+    # LR hyperparameters for calibration CV evaluation.
+    C: float = 1.0
+    max_iter: int = 1500
+    class_weight: str | None = "balanced"
+
+    # Filter-bank sub-band definitions (shared with mental command pipeline).
+    filter_bank_bands: tuple[tuple[float, float], ...] = (
+        (4.0, 8.0),    # theta
+        (8.0, 13.0),   # alpha
+        (13.0, 30.0),  # beta
+        (30.0, 45.0),  # low-gamma
+    )
+
+    # Online GMM adaptation.
+    gmm_learning_rate: float = 0.05
+    gmm_cov_reg: float = 1e-6
 
 @dataclass(frozen=True)
 class SerialConfig:
@@ -117,8 +132,11 @@ class MentalCommandTaskConfig:
     n_register_command: int = 6
 
     # Sliding-window extraction from registration blocks.
-    train_window_s: float = 1.0
-    train_window_step_s: float = 0.25
+    train_window_s: float = 2.0
+    train_window_step_s: float = 0.5
+
+    # Extra seconds of context to fetch before the live window for clean filtering.
+    live_filter_context_s: float = 2.0
 
     # Continuous live feedback settings.
     live_update_interval_s: float = 0.10
@@ -131,7 +149,7 @@ class MentalCommandTaskConfig:
 
 @dataclass(frozen=True)
 class MentalCommandModelConfig:
-    # Riemannian features + multinomial logistic regression.
+    # Shared logistic regression hyperparameters for both pipelines.
     C: float = 1.0
     max_iter: int = 1500
     class_weight: str | None = "balanced"
@@ -139,3 +157,11 @@ class MentalCommandModelConfig:
     # Basic CV quality gate before live mode.
     cv_splits_max: int = 5
     min_per_class_for_cv: int = 4
+
+    # Filter-bank sub-band definitions (lo_hz, hi_hz).
+    filter_bank_bands: tuple[tuple[float, float], ...] = (
+        (4.0, 8.0),    # theta
+        (8.0, 13.0),   # alpha
+        (13.0, 30.0),  # beta
+        (30.0, 45.0),  # low-gamma
+    )

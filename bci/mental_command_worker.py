@@ -6,7 +6,7 @@ import numpy as np
 from mne.filter import filter_data, notch_filter
 from pyriemann.estimation import Covariances
 from pyriemann.tangentspace import TangentSpace
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
 from sklearn.pipeline import Pipeline
@@ -15,12 +15,19 @@ from sklearn.preprocessing import StandardScaler
 from config import EEGConfig, MentalCommandModelConfig
 
 
-def filter_window(X: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray:
-    """Bandpass/notch filter for one or many windows.
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
 
-    X shape: (n_ch, n_samp) or (n_win, n_ch, n_samp).
+def filter_block(block: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray:
+    """Wide bandpass + optional notch for a continuous segment.
+
+    Uses IIR (4th-order Butterworth, zero-phase) so that edge effects are
+    negligible even on segments as short as ~2-3 s.
+
+    block shape: (n_ch, n_samples).
     """
-    Xf = np.asarray(X, dtype=np.float64, order="C")
+    Xf = np.asarray(block, dtype=np.float64, order="C")
     if eeg_cfg.notch is not None:
         Xf = notch_filter(Xf, Fs=sfreq, freqs=[float(eeg_cfg.notch)], verbose="ERROR")
     Xf = filter_data(
@@ -28,10 +35,16 @@ def filter_window(X: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.ndarray
         sfreq=float(sfreq),
         l_freq=float(eeg_cfg.l_freq),
         h_freq=float(eeg_cfg.h_freq),
+        method="iir",
+        iir_params=dict(order=4, ftype="butter", output="sos"),
         verbose="ERROR",
     )
     return Xf.astype(np.float32, copy=False)
 
+
+# ---------------------------------------------------------------------------
+# Windowing
+# ---------------------------------------------------------------------------
 
 def split_windows(
     block: np.ndarray,
@@ -58,26 +71,131 @@ def split_windows(
     return out
 
 
-def make_mental_command_classifier(model_cfg: MentalCommandModelConfig) -> Pipeline:
-    return Pipeline(
-        [
-            ("cov", Covariances(estimator="oas")),
-            ("ts", TangentSpace(metric="riemann")),
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            (
-                "clf",
-                LogisticRegression(
-                    C=float(model_cfg.C),
-                    solver="lbfgs",
-                    multi_class="multinomial",
-                    max_iter=int(model_cfg.max_iter),
-                    class_weight=model_cfg.class_weight,
-                    random_state=42,
-                ),
-            ),
-        ]
+# ---------------------------------------------------------------------------
+# Sub-band helper (shared by both feature extractors)
+# ---------------------------------------------------------------------------
+
+def _iir_bandpass(X: np.ndarray, sfreq: float, lo: float, hi: float) -> np.ndarray:
+    """Zero-phase IIR bandpass on an (n_windows, n_ch, n_samples) array.
+
+    Reshapes to 2-D so that ``mne.filter.filter_data`` always receives a
+    simple (rows, time) matrix — guaranteed safe for the IIR path.
+    """
+    X64 = np.asarray(X, dtype=np.float64)
+    orig_shape = X64.shape
+    if X64.ndim == 3:
+        X64 = X64.reshape(-1, orig_shape[-1])
+    filtered = filter_data(
+        X64,
+        sfreq=float(sfreq),
+        l_freq=float(lo),
+        h_freq=float(hi),
+        method="iir",
+        iir_params=dict(order=4, ftype="butter", output="sos"),
+        verbose="ERROR",
+    )
+    return filtered.reshape(orig_shape).astype(np.float32, copy=False)
+
+
+# ---------------------------------------------------------------------------
+# Feature extractors
+# ---------------------------------------------------------------------------
+
+class FilterBankTangentSpace(BaseEstimator, TransformerMixin):
+    """Per-band Riemannian covariance → tangent-space projection, concatenated."""
+
+    def __init__(self, bands=((4, 8), (8, 13), (13, 30), (30, 45)),
+                 sfreq: float = 300.0, cov_estimator: str = "oas"):
+        self.bands = bands
+        self.sfreq = sfreq
+        self.cov_estimator = cov_estimator
+
+    def fit(self, X, y=None):
+        self.cov_estimators_: list[Covariances] = []
+        self.ts_estimators_: list[TangentSpace] = []
+        for lo, hi in self.bands:
+            X_band = _iir_bandpass(X, self.sfreq, lo, hi)
+            cov_est = Covariances(estimator=self.cov_estimator)
+            covs = cov_est.fit_transform(X_band)
+            ts = TangentSpace(metric="riemann")
+            ts.fit(covs)
+            self.cov_estimators_.append(cov_est)
+            self.ts_estimators_.append(ts)
+        return self
+
+    def transform(self, X):
+        parts = []
+        for i, (lo, hi) in enumerate(self.bands):
+            X_band = _iir_bandpass(X, self.sfreq, lo, hi)
+            covs = self.cov_estimators_[i].transform(X_band)
+            parts.append(self.ts_estimators_[i].transform(covs))
+        return np.concatenate(parts, axis=1)
+
+
+class LogBandPowerFeatures(BaseEstimator, TransformerMixin):
+    """Log-variance (≈ log band power) per channel per sub-band."""
+
+    def __init__(self, bands=((4, 8), (8, 13), (13, 30), (30, 45)),
+                 sfreq: float = 300.0):
+        self.bands = bands
+        self.sfreq = sfreq
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        parts = []
+        for lo, hi in self.bands:
+            X_band = _iir_bandpass(X, self.sfreq, lo, hi)
+            log_bp = np.log(np.var(X_band, axis=-1) + 1e-10)
+            parts.append(log_bp)
+        return np.concatenate(parts, axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline constructors
+# ---------------------------------------------------------------------------
+
+def _make_lr(model_cfg: MentalCommandModelConfig) -> LogisticRegression:
+    return LogisticRegression(
+        C=float(model_cfg.C),
+        solver="lbfgs",
+        multi_class="multinomial",
+        max_iter=int(model_cfg.max_iter),
+        class_weight=model_cfg.class_weight,
+        random_state=42,
     )
 
+
+def make_fb_riemannian_classifier(
+    model_cfg: MentalCommandModelConfig, sfreq: float,
+) -> Pipeline:
+    return Pipeline([
+        ("fb_ts", FilterBankTangentSpace(
+            bands=model_cfg.filter_bank_bands,
+            sfreq=sfreq,
+        )),
+        ("scaler", StandardScaler()),
+        ("clf", _make_lr(model_cfg)),
+    ])
+
+
+def make_bandpower_classifier(
+    model_cfg: MentalCommandModelConfig, sfreq: float,
+) -> Pipeline:
+    return Pipeline([
+        ("bp", LogBandPowerFeatures(
+            bands=model_cfg.filter_bank_bands,
+            sfreq=sfreq,
+        )),
+        ("scaler", StandardScaler()),
+        ("clf", _make_lr(model_cfg)),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation quality estimate
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MCQuality:
@@ -92,21 +210,20 @@ def evaluate_cv_quality(
     X: np.ndarray,
     y: np.ndarray,
     block_ids: np.ndarray,
-    model_cfg: MentalCommandModelConfig,
+    pipeline: Pipeline,
     cv_splits_max: int,
 ) -> MCQuality:
+    """Block-grouped cross-validation (one registration block held out per class per fold)."""
     y = np.asarray(y, dtype=int)
     block_ids = np.asarray(block_ids, dtype=int)
     if y.shape[0] != X.shape[0] or block_ids.shape[0] != X.shape[0]:
         raise ValueError("X, y, and block_ids must have the same first dimension")
 
     classes, counts = np.unique(y, return_counts=True)
-    # Build class-local block ids so each fold can hold out exactly one 8s block per class.
-    class_block_ids = {}
+    class_block_ids: dict[int, np.ndarray] = {}
     for c in classes:
         class_mask = y == int(c)
-        uniq = np.unique(block_ids[class_mask])
-        class_block_ids[int(c)] = np.sort(uniq)
+        class_block_ids[int(c)] = np.sort(np.unique(block_ids[class_mask]))
 
     min_block_count = min(len(v) for v in class_block_ids.values())
     n_splits = min(int(cv_splits_max), int(min_block_count))
@@ -116,10 +233,7 @@ def evaluate_cv_quality(
             f"Not enough registration blocks for grouped CV: per-class blocks={block_counts}"
         )
 
-    clf = make_mental_command_classifier(model_cfg)
     y_pred = np.empty_like(y)
-
-    # Fold k: hold out one class-specific registration block for each class.
     for k in range(n_splits):
         test_mask = np.zeros(y.shape[0], dtype=bool)
         for c in classes:
@@ -129,7 +243,7 @@ def evaluate_cv_quality(
         if not np.any(test_mask) or not np.any(train_mask):
             raise ValueError(f"Invalid CV split at fold {k}")
 
-        fold_clf = clone(clf)
+        fold_clf = clone(pipeline)
         fold_clf.fit(X[train_mask], y[train_mask])
         y_pred[test_mask] = fold_clf.predict(X[test_mask])
 
@@ -147,6 +261,10 @@ def evaluate_cv_quality(
         per_class_accuracy=per_class_acc,
     )
 
+
+# ---------------------------------------------------------------------------
+# Live-mode smoother
+# ---------------------------------------------------------------------------
 
 class EMAProbSmoother:
     def __init__(self, alpha: float, n_classes: int):

@@ -26,10 +26,12 @@ from config import (
     SerialConfig,
 )
 from bci_worker import (
+    CalibrationResult,
     train_initial_classifier,
     run_cv,
     filter_epoch,
     RawCSVRecorder,
+    _make_fb_pipeline,
 )
 
 
@@ -137,11 +139,11 @@ def run_task(fname: str):
         return 0 if int(code) == LEFT else 1
 
     # Timing
-    PREP_DURATION = 2.0
+    PREP_DURATION = 3.0
     MI_DURATION = eeg_cfg.tmax - eeg_cfg.tmin  # e.g. 2.0 s
     ITI = 3.0
     N_CAL_TRIALS = cal_cfg.n_calibration_trials
-    N_LIVE_TRIALS = 20
+    N_LIVE_TRIALS = 40
     EPOCH_POLL_TIMEOUT = eeg_cfg.tmin + 1.5  # seconds to wait for epoch after MI
 
     # UI geometry & colours
@@ -338,6 +340,8 @@ def run_task(fname: str):
         block_size=max(2, model_cfg.retrain_every), left_code=LEFT, right_code=RIGHT,
     )
 
+    cal_result: CalibrationResult | None = None
+
     try:
         for cal_idx in range(N_CAL_TRIALS):
             y_true_code = cal_scheduler.next_code()
@@ -409,24 +413,24 @@ def run_task(fname: str):
         # ==============================================================
         # TRAINING
         # ==============================================================
-        cue_text.text = "Training classifier on calibration data...\nPlease wait."
+        cue_text.text = "Training classifiers...\nComparing FB Riemannian vs Log Band Power."
         status_text.text = ""
         draw_scene()
         win.flip()
 
-        classifier = None
-        best_C: float | None = None
-
         try:
-            classifier, best_C, cv_mean, cv_std, n_per_class = train_initial_classifier(
-                X_cal, y_cal, model_cfg, LEFT, RIGHT,
+            cal_result = train_initial_classifier(
+                X_cal, y_cal, model_cfg, sfreq, LEFT, RIGHT,
             )
             cue_text.text = (
                 f"Calibration Complete!\n\n"
-                f"Cross-validated accuracy: {cv_mean:.1%} +/- {cv_std:.1%}\n"
+                f"FB Riemannian CV: {cal_result.fb_cv_mean:.1%}\n"
+                f"Log Band Power CV: {cal_result.bp_cv_mean:.1%}\n"
+                f"Selected: {cal_result.chosen_name} "
+                f"({cal_result.cv_mean:.1%} +/- {cal_result.cv_std:.1%})\n"
                 f"Epochs: {len(y_cal)} "
-                f"(L={n_per_class.get(str(LEFT), 0)}, R={n_per_class.get(str(RIGHT), 0)})\n"
-                f"Selected C: {best_C}\n\n"
+                f"(L={cal_result.n_per_class.get(str(LEFT), 0)}, "
+                f"R={cal_result.n_per_class.get(str(RIGHT), 0)})\n\n"
                 f"Press SPACE to begin online phase."
             )
         except Exception as exc:
@@ -438,7 +442,7 @@ def run_task(fname: str):
         win.flip()
         wait_for_space()
 
-        if classifier is None:
+        if cal_result is None:
             cue_text.text = "No classifier available.\nPress ESC to exit."
             status_text.text = ""
             draw_scene()
@@ -448,12 +452,10 @@ def run_task(fname: str):
             raise KeyboardInterrupt  # jump to cleanup
 
         # ==============================================================
-        # PHASE 2: ONLINE TRIALS
+        # PHASE 2: ONLINE TRIALS (frozen features + GMM)
         # ==============================================================
-        X_store: list[np.ndarray] = list(X_cal)
-        y_store: list[int] = list(y_cal)
-        total_accepted = len(X_cal)
-        last_train_at = total_accepted
+        feature_extractor = cal_result.feature_extractor
+        gmm = cal_result.gmm
         correct_count = 0
 
         scheduler = BalancedBlockScheduler(
@@ -523,18 +525,15 @@ def run_task(fname: str):
                 set_targets(None)
                 continue
 
-            # Accumulate
+            # Accumulate for offline analysis / final CV.
             X_all.append(epoch)
             y_all.append(y_true_code)
-            X_store.append(epoch)
-            y_store.append(y_true_code)
-            total_accepted += 1
 
-            # --- Predict ---
+            # --- Predict with frozen features + GMM ---
             x_i = epoch[np.newaxis, ...]  # (1, n_ch, n_samp)
-            proba = classifier.predict_proba(x_i)[0]
-            classes = classifier.named_steps["clf"].classes_
-            y_pred_code = int(classes[int(np.argmax(proba))])
+            features = feature_extractor.transform(x_i)  # (1, n_features)
+            proba = gmm.predict_proba(features)[0]
+            y_pred_code = int(gmm.classes_[int(np.argmax(proba))])
             conf = float(np.max(proba))
 
             # --- Feedback: send ErrP marker at cursor movement instant ---
@@ -550,17 +549,8 @@ def run_task(fname: str):
             wait_with_display(0.4)
             set_targets(None)
 
-            # --- Online retraining ---
-            if (total_accepted - last_train_at) >= model_cfg.retrain_every and len(y_store) >= 4:
-                status_text.text = "Retraining..."
-                draw_scene()
-                win.flip()
-
-                X_train = np.stack(X_store, axis=0)
-                y_train = np.array(y_store, dtype=int)
-                classifier.fit(X_train, y_train)
-                last_train_at = total_accepted
-                print(f"[RETRAIN] Fitted on {len(y_store)} epochs (total accepted: {total_accepted})")
+            # --- Per-epoch GMM update (smooth co-adaptation) ---
+            gmm.update(features[0], y_true_code)
 
         # ==============================================================
         # SESSION COMPLETE
@@ -592,9 +582,12 @@ def run_task(fname: str):
             np.save(f"{fname}_labels.npy", y_save)
             print(f"[SAVE] {X_save.shape[0]} epochs -> {fname}_data.npy")
 
-            cv_mean, cv_std, cv_scores = run_cv(X_save, y_save, model_cfg, fixed_C=best_C)
-            if len(cv_scores) > 0:
-                print(f"\nFinal CV (fixed C={best_C}): {cv_mean:.3f} +/- {cv_std:.3f}")
+            if cal_result is not None:
+                cv_mean, cv_std, cv_scores = run_cv(
+                    X_save, y_save, cal_result.full_pipeline,
+                )
+                if len(cv_scores) > 0:
+                    print(f"\nFinal CV ({cal_result.chosen_name}): {cv_mean:.3f} +/- {cv_std:.3f}")
 
         trig.close()
         for resource in [epochs_online, stream]:

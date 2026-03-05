@@ -20,8 +20,9 @@ from config import (
 from mental_command_worker import (
     EMAProbSmoother,
     evaluate_cv_quality,
-    filter_window,
-    make_mental_command_classifier,
+    filter_block,
+    make_bandpower_classifier,
+    make_fb_riemannian_classifier,
     split_windows,
 )
 
@@ -181,22 +182,22 @@ def run_task(fname: str):
             return np.empty((len(ch_names), 0), dtype=np.float32)
         return np.concatenate(chunks, axis=1)
 
-    def latest_window(n_samples: int) -> np.ndarray | None:
-        data, _ = stream.get_data(winsize=task_cfg.train_window_s, picks="all")
-        if data.size == 0 or data.shape[1] < n_samples:
-            return None
-        return np.asarray(data[:, -n_samples:], dtype=np.float32)
-
+    # ------------------------------------------------------------------
+    # Session state
+    # ------------------------------------------------------------------
     classifier = None
     class_index = None
     smoother = None
-    model_windows = []
-    model_labels = []
-    model_block_ids = []
+    model_windows: list[np.ndarray] = []
+    model_labels: list[int] = []
+    model_block_ids: list[int] = []
     reject_thresh = eeg_cfg.reject_peak_to_peak
     w_samples = int(round(task_cfg.train_window_s * sfreq))
 
     try:
+        # ==============================================================
+        # Calibration phase
+        # ==============================================================
         cue.text = (
             "Calibration phase\n"
             f"Record Neutral + {label_cfg.command1_name} + {label_cfg.command2_name}\n\n"
@@ -218,7 +219,7 @@ def run_task(fname: str):
                 f"You will complete {n_blocks} accepted blocks.\n"
                 "Press SPACE when ready to start this target."
             )
-            status.text = "Each block is 8s, then you choose accept or redo."
+            status.text = f"Each block is {task_cfg.register_duration_s:.0f}s, then you choose accept or redo."
             detected.text = ""
             update_bar(0.0, 0.0, 1.0)
             wait_for_space()
@@ -241,12 +242,12 @@ def run_task(fname: str):
 
                     cue.text = f"Perform: {class_name}"
                     status.text = f"Hold this mental state for {task_cfg.register_duration_s:.1f}s"
-                    block = collect_block(task_cfg.register_duration_s)
+                    raw_block = collect_block(task_cfg.register_duration_s)
 
-                    if block.shape[1] < w_samples:
+                    if raw_block.shape[1] < w_samples:
                         print(
                             f"[REG] {class_name} block {block_num} attempt {attempt}: "
-                            f"not enough data ({block.shape[1]} samples), retrying"
+                            f"not enough data ({raw_block.shape[1]} samples), retrying"
                         )
                         cue.text = f"{class_name} block too short"
                         status.text = "Not enough EEG samples. Press SPACE to retry."
@@ -255,8 +256,11 @@ def run_task(fname: str):
                         wait_for_space()
                         continue
 
+                    # Filter the entire block, THEN split into windows
+                    # (avoids FIR/IIR edge effects on short windows).
+                    filtered_block = filter_block(raw_block, eeg_cfg, sfreq)
                     windows = split_windows(
-                        block=block,
+                        block=filtered_block,
                         sfreq=sfreq,
                         window_s=task_cfg.train_window_s,
                         step_s=task_cfg.train_window_step_s,
@@ -269,24 +273,27 @@ def run_task(fname: str):
                         wait_for_space()
                         continue
 
-                    windows = filter_window(windows, eeg_cfg=eeg_cfg, sfreq=sfreq)
-                    block_windows = []
+                    # Artifact rejection per window
+                    n_total = int(windows.shape[0])
+                    block_windows: list[np.ndarray] = []
                     for w in windows:
                         if reject_thresh is not None and float(np.ptp(w, axis=-1).max()) > reject_thresh:
                             continue
                         block_windows.append(w)
+                    n_rejected = n_total - len(block_windows)
 
                     if len(block_windows) == 0:
                         cue.text = "No usable windows in this block"
-                        status.text = "All windows rejected. Press SPACE to retry."
+                        status.text = f"All {n_total} windows exceeded artifact threshold. Press SPACE to retry."
                         detected.text = ""
                         update_bar(0.0, 0.0, 1.0)
                         wait_for_space()
                         continue
 
+                    # Show rejection stats and let user decide
                     cue.text = f"Review block: {class_name} {block_num}/{n_blocks}"
                     status.text = (
-                        f"Usable windows: {len(block_windows)}/{len(windows)}\n"
+                        f"{len(block_windows)} usable, {n_rejected} artifact-rejected, {n_total} total\n"
                         "SPACE = accept block, R = reject and redo"
                     )
                     detected.text = "Did you maintain the intended mental state?"
@@ -309,7 +316,7 @@ def run_task(fname: str):
                         model_block_ids.append(trial_block_id)
                     print(
                         f"[REG] Accepted {class_name} block {block_num}/{n_blocks}: "
-                        f"{len(block_windows)}/{len(windows)} windows (attempt {attempt})"
+                        f"{len(block_windows)} usable, {n_rejected} rejected (attempt {attempt})"
                     )
                     break
 
@@ -328,6 +335,9 @@ def run_task(fname: str):
                 update_bar(0.0, 0.0, 1.0)
                 wait_for_space()
 
+        # ==============================================================
+        # Model training — evaluate both pipelines, pick the better one
+        # ==============================================================
         if len(model_labels) == 0:
             raise RuntimeError("No registration windows collected")
 
@@ -341,15 +351,32 @@ def run_task(fname: str):
         X_train = np.stack(model_windows, axis=0)
         y_train = np.array(model_labels, dtype=int)
         block_ids = np.array(model_block_ids, dtype=int)
-        quality = evaluate_cv_quality(
-            X=X_train,
-            y=y_train,
-            block_ids=block_ids,
-            model_cfg=model_cfg,
-            cv_splits_max=model_cfg.cv_splits_max,
+
+        cue.text = "Fitting classifiers..."
+        status.text = "Evaluating Filter-Bank Riemannian and Log Band Power pipelines."
+        detected.text = ""
+        update_bar(0.0, 0.0, 1.0)
+        draw_frame()
+
+        fb_pipe = make_fb_riemannian_classifier(model_cfg, sfreq)
+        bp_pipe = make_bandpower_classifier(model_cfg, sfreq)
+
+        fb_quality = evaluate_cv_quality(
+            X_train, y_train, block_ids, fb_pipe, model_cfg.cv_splits_max,
+        )
+        bp_quality = evaluate_cv_quality(
+            X_train, y_train, block_ids, bp_pipe, model_cfg.cv_splits_max,
         )
 
-        classifier = make_mental_command_classifier(model_cfg)
+        if fb_quality.balanced_accuracy >= bp_quality.balanced_accuracy:
+            chosen_name = "Filter-Bank Riemannian"
+            quality = fb_quality
+            classifier = fb_pipe
+        else:
+            chosen_name = "Log Band Power"
+            quality = bp_quality
+            classifier = bp_pipe
+
         classifier.fit(X_train, y_train)
         class_index = {int(c): i for i, c in enumerate(classifier.named_steps["clf"].classes_)}
         smoother = EMAProbSmoother(
@@ -364,11 +391,13 @@ def run_task(fname: str):
 
         cue.text = (
             "Calibration complete\n\n"
-            f"CV balanced acc: {quality.balanced_accuracy:.2%}\n"
-            f"CV macro F1: {quality.macro_f1:.2%}\n"
-            f"CV class acc (Neutral): {quality.per_class_accuracy[str(code_neutral)]:.2%}\n"
-            f"CV class acc ({label_cfg.command1_name}): {quality.per_class_accuracy[str(code_c1)]:.2%}\n"
-            f"CV class acc ({label_cfg.command2_name}): {quality.per_class_accuracy[str(code_c2)]:.2%}\n"
+            f"FB Riemannian CV: {fb_quality.balanced_accuracy:.1%} bal acc\n"
+            f"Log Band Power CV: {bp_quality.balanced_accuracy:.1%} bal acc\n\n"
+            f"Selected: {chosen_name}\n"
+            f"  Balanced acc: {quality.balanced_accuracy:.2%}  |  Macro F1: {quality.macro_f1:.2%}\n"
+            f"  Neutral: {quality.per_class_accuracy[str(code_neutral)]:.0%}"
+            f"  {label_cfg.command1_name}: {quality.per_class_accuracy[str(code_c1)]:.0%}"
+            f"  {label_cfg.command2_name}: {quality.per_class_accuracy[str(code_c2)]:.0%}\n"
             f"Samples: {quality.n_samples}"
         )
         status.text = (
@@ -381,6 +410,9 @@ def run_task(fname: str):
         update_bar(0.0, 0.0, 1.0)
         wait_for_space()
 
+        # ==============================================================
+        # Live feedback mode
+        # ==============================================================
         cue.text = "Live mental command practice"
         status.text = (
             "Think Neutral or either command and watch the bar.\n"
@@ -394,6 +426,12 @@ def run_task(fname: str):
         pred_clock = core.Clock()
         session_clock = core.Clock()
         p_vec = np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float64)
+
+        # Live window: grab extra context for clean wide-bandpass filtering,
+        # then crop to the analysis window before passing to the classifier.
+        live_total_s = task_cfg.train_window_s + task_cfg.live_filter_context_s
+        live_total_n = int(round(live_total_s * sfreq))
+        last_live_ts: float | None = None
 
         while session_clock.getTime() < task_cfg.live_duration_s:
             tick_recorder()
@@ -409,11 +447,16 @@ def run_task(fname: str):
 
             if pred_clock.getTime() >= task_cfg.live_update_interval_s:
                 pred_clock.reset()
-                x_win = latest_window(w_samples)
-                if x_win is not None:
-                    x_win = filter_window(x_win, eeg_cfg=eeg_cfg, sfreq=sfreq)
-                    p_raw = classifier.predict_proba(x_win[np.newaxis, ...])[0]
-                    p_vec = smoother.update(p_raw)
+                data, ts = stream.get_data(winsize=live_total_s, picks="all")
+                if data.size > 0 and data.shape[1] >= live_total_n:
+                    cur_ts = float(ts[-1]) if ts is not None and len(ts) > 0 else None
+                    if cur_ts is not None and (last_live_ts is None or cur_ts > last_live_ts):
+                        last_live_ts = cur_ts
+                        chunk = np.asarray(data[:, -live_total_n:], dtype=np.float32)
+                        chunk_filtered = filter_block(chunk, eeg_cfg, sfreq)
+                        x_win = chunk_filtered[:, -w_samples:]
+                        p_raw = classifier.predict_proba(x_win[np.newaxis, ...])[0]
+                        p_vec = smoother.update(p_raw)
 
             left_p = p_vec[class_index[code_c1]]
             right_p = p_vec[class_index[code_c2]]
