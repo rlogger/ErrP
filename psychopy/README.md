@@ -1,4 +1,5 @@
 # Motor Imagery Session Guide (Participant Instructions)
+This is for the task mi_task.py, but many of the instructions are generally applicable.
 
 This session collects EEG during **left vs right motor imagery**.
 You will not physically move your hands during the task.
