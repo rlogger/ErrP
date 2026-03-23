@@ -49,17 +49,17 @@ SAFE_RIGHT = LANE_RIGHT
 
 @dataclass(frozen=True)
 class TriggerCodes:
-    correct_left: int = 11
-    correct_right: int = 12
-    system_error_left: int = 21
-    system_error_right: int = 22
-    user_mistake_left: int = 31
-    user_mistake_right: int = 32
-    timeout_center: int = 40
-    cue_safe_left: int = 51
-    cue_safe_right: int = 52
-    block_start: int = 60
-    session_end: int = 99
+    correct_left: int = 1
+    correct_right: int = 2
+    system_error_left: int = 3
+    system_error_right: int = 4
+    user_mistake_left: int = 5
+    user_mistake_right: int = 6
+    timeout_center: int = 7
+    cue_safe_left: int = 8
+    cue_safe_right: int = 9
+    block_start: int = 10
+    session_end: int = 11
 
 
 @dataclass(frozen=True)
@@ -169,16 +169,21 @@ class TriggerHub:
         print(f"[TRIGGER] Connected on {port} @ {self.cfg.baudrate} baud.")
 
     def close(self) -> None:
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            finally:
-                self.ser = None
+        with self._lock:
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                finally:
+                    self.ser = None
 
-    def pulse(self, code: int) -> None:
+    def pulse(self, code: int, wait: bool = False) -> None:
         if self.ser is None:
             return
-        thread = threading.Thread(target=self._pulse_blocking, args=(int(code) & 0xFF,), daemon=True)
+        code = int(code) & 0xFF
+        if wait:
+            self._pulse_blocking(code)
+            return
+        thread = threading.Thread(target=self._pulse_blocking, args=(code,), daemon=True)
         thread.start()
 
     def _pulse_blocking(self, code: int) -> None:
@@ -366,7 +371,7 @@ class RacingErrPGame:
         self.closed = True
         self.running = False
         try:
-            self.trigger_hub.pulse(self.triggers.session_end)
+            self.trigger_hub.pulse(self.triggers.session_end, wait=True)
         except Exception:
             pass
         self.trigger_hub.close()
@@ -1044,8 +1049,8 @@ class RacingErrPGame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ErrP racing task with optional trigger-hub support")
-    parser.add_argument("--trials", type=int, default=120)
-    parser.add_argument("--break-every", type=int, default=20)
+    parser.add_argument("--trials", type=int, default=250)
+    parser.add_argument("--break-every", type=int, default=25)
     parser.add_argument("--error-prob", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--fullscreen", action="store_true")

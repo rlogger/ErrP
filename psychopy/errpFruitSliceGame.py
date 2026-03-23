@@ -38,20 +38,20 @@ SIDE_RIGHT = 1
 
 @dataclass(frozen=True)
 class TriggerCodes:
-    correct_left: int = 11
-    correct_right: int = 12
-    system_error_left: int = 21
-    system_error_right: int = 22
-    user_wrong_side_left: int = 31
-    user_wrong_side_right: int = 32
-    user_bad_timing_left: int = 41
-    user_bad_timing_right: int = 42
-    user_no_response_left: int = 51
-    user_no_response_right: int = 52
-    cue_fruit_left: int = 61
-    cue_fruit_right: int = 62
-    block_start: int = 70
-    session_end: int = 99
+    correct_left: int = 1
+    correct_right: int = 2
+    system_error_left: int = 3
+    system_error_right: int = 4
+    user_wrong_side_left: int = 5
+    user_wrong_side_right: int = 6
+    user_bad_timing_left: int = 7
+    user_bad_timing_right: int = 8
+    user_no_response_left: int = 9
+    user_no_response_right: int = 10
+    cue_fruit_left: int = 11
+    cue_fruit_right: int = 12
+    block_start: int = 13
+    session_end: int = 14
 
 
 @dataclass(frozen=True)
@@ -67,16 +67,16 @@ class SerialConfig:
 
 @dataclass(frozen=True)
 class TaskConfig:
-    trials: int = 120
-    break_every: int = 20
+    trials: int = 250
+    break_every: int = 25
     error_prob: float = 0.30
     window_width: int = 1440
     window_height: int = 900
     fullscreen: bool = False
     target_fps: int = 120
     seed: int | None = None
-    travel_min_s: float = 1.95
-    travel_max_s: float = 2.25
+    travel_min_s: float = 2.00
+    travel_max_s: float = 2.50
     gap_min_s: float = 0.55
     gap_max_s: float = 1.05
     action_duration_s: float = 0.72
@@ -173,16 +173,21 @@ class TriggerHub:
         print(f"[TRIGGER] Connected on {port} @ {self.cfg.baudrate} baud.")
 
     def close(self) -> None:
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            finally:
-                self.ser = None
+        with self._lock:
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                finally:
+                    self.ser = None
 
-    def pulse(self, code: int) -> None:
+    def pulse(self, code: int, wait: bool = False) -> None:
         if self.ser is None:
             return
-        thread = threading.Thread(target=self._pulse_blocking, args=(int(code) & 0xFF,), daemon=True)
+        code = int(code) & 0xFF
+        if wait:
+            self._pulse_blocking(code)
+            return
+        thread = threading.Thread(target=self._pulse_blocking, args=(code,), daemon=True)
         thread.start()
 
     def _pulse_blocking(self, code: int) -> None:
@@ -402,7 +407,7 @@ class FruitSliceErrPGame:
         self.closed = True
         self.running = False
         try:
-            self.trigger_hub.pulse(self.triggers.session_end)
+            self.trigger_hub.pulse(self.triggers.session_end, wait=True)
         except Exception:
             pass
         self.trigger_hub.close()
