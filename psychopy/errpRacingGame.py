@@ -75,8 +75,8 @@ class SerialConfig:
 
 @dataclass(frozen=True)
 class TaskConfig:
-    trials: int = 120
-    break_every: int = 20
+    trials: int = 250
+    break_every: int = 25
     error_prob: float = 0.30
     window_width: int = 1440
     window_height: int = 900
@@ -1047,51 +1047,14 @@ class RacingErrPGame:
                 self._draw_text("READY", self.font_body, (205, 232, 246), self.width / 2, self.horizon_y + 20, anchor="midtop")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ErrP racing task with optional trigger-hub support")
-    parser.add_argument("--trials", type=int, default=250)
-    parser.add_argument("--break-every", type=int, default=25)
-    parser.add_argument("--error-prob", type=float, default=0.20)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--fullscreen", action="store_true")
-    parser.add_argument("--window-width", type=int, default=1440)
-    parser.add_argument("--window-height", type=int, default=900)
-    parser.add_argument("--fps", type=int, default=120)
-    parser.add_argument("--log-dir", type=str, default=".")
-    parser.add_argument("--port", type=str, default=None)
-    parser.add_argument("--baudrate", type=int, default=115200)
-    parser.add_argument("--pulse-width", type=float, default=0.01)
-    parser.add_argument("--vid", type=lambda x: int(x, 0), default="0x2341")
-    parser.add_argument("--pid", type=lambda x: int(x, 0), default="0x8037")
-    parser.add_argument("--no-trigger", action="store_true")
-    return parser.parse_args()
-
 
 def build_session_name() -> str:
     return datetime.now().strftime("errp_racing_%Y%m%d_%H%M%S")
 
 
 def main() -> None:
-    args = parse_args()
-    cfg = TaskConfig(
-        trials=args.trials,
-        break_every=args.break_every,
-        error_prob=args.error_prob,
-        window_width=args.window_width,
-        window_height=args.window_height,
-        fullscreen=args.fullscreen,
-        target_fps=args.fps,
-        seed=args.seed,
-        log_dir=args.log_dir,
-    )
-    serial_cfg = SerialConfig(
-        port=args.port,
-        baudrate=args.baudrate,
-        pulse_width_s=args.pulse_width,
-        vid=args.vid,
-        pid=args.pid,
-        enabled=not args.no_trigger,
-    )
+    cfg = TaskConfig()
+    serial_cfg = SerialConfig()
     session_name = build_session_name()
 
     print(f"[SESSION] {session_name}")
