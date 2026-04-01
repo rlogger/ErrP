@@ -43,7 +43,7 @@ def _make_task_logger(fname: str) -> logging.Logger:
     return logger
 
 
-def _channel_stat_map(channel_names: list[str], values: np.ndarray, precision: int = 3) -> dict[str, float]:
+def _channel_stat_map(channel_names: list[str], values: np.ndarray, precision: int = 6) -> dict[str, float]:
     return {
         str(ch): round(float(val), precision)
         for ch, val in zip(channel_names, np.asarray(values).tolist())
@@ -66,10 +66,10 @@ def _top_channel_deviation_summary(
     for idx in top_idx:
         summary.append({
             "channel": str(channel_names[int(idx)]),
-            "value": round(float(current_values[int(idx)]), 3),
-            "train_mean": round(float(ref_means[int(idx)]), 3),
-            "train_std": round(float(ref_stds[int(idx)]), 3),
-            "abs_z": round(float(z[int(idx)]), 3),
+            "value": round(float(current_values[int(idx)]), 6),
+            "train_mean": round(float(ref_means[int(idx)]), 6),
+            "train_std": round(float(ref_stds[int(idx)]), 6),
+            "abs_z": round(float(z[int(idx)]), 6),
         })
     return summary
 
@@ -212,7 +212,7 @@ def run_task(fname: str):
     try:
         logger.info(
             "Starting offline model preparation: data_dir=%s, edf_glob=%s, window_s=%.3f, step_s=%.3f, "
-            "filter_band=[%.1f, %.1f], filter_context_s=%.3f",
+            "filter_band=[%.1f, %.1f], filter_context_s=%.3f, offline_eeg_scale_to_match_live=%.3f, live_units=%s",
             task_cfg.data_dir,
             task_cfg.edf_glob,
             task_cfg.window_s,
@@ -220,6 +220,8 @@ def run_task(fname: str):
             eeg_cfg.l_freq,
             eeg_cfg.h_freq,
             task_cfg.filter_context_s,
+            task_cfg.offline_eeg_scale_to_match_live,
+            task_cfg.live_eeg_units,
         )
         cue.text = "Preparing model from offline EDF sessions..."
         status.text = (
@@ -275,7 +277,7 @@ def run_task(fname: str):
         train_ch_ptp_std = np.std(train_ch_ptp, axis=0)
         logger.info(
             "Offline dataset ready: files_used=%d/%d, trials=%d, windows=%d, class_counts=%s, "
-            "loso_mean=%.4f, loso_std=%.4f",
+            "loso_mean=%.4f, loso_std=%.4f, eeg_units=%s, offline_scale_applied=%.3f",
             dataset.n_files_used,
             dataset.n_files_found,
             dataset.n_trials,
@@ -283,6 +285,8 @@ def run_task(fname: str):
             counts,
             loso.mean_accuracy,
             loso.std_accuracy,
+            dataset.eeg_units,
+            dataset.offline_scale_applied,
         )
         logger.info(
             "Classifier class order: classes=%s, class_index=%s, left_code=%d -> prob_index=%d, right_code=%d -> prob_index=%d",
@@ -302,7 +306,8 @@ def run_task(fname: str):
             train_pred_counts,
         )
         logger.info(
-            "Offline channel diagnostics: std_mean_by_channel=%s, ptp_mean_by_channel=%s",
+            "Offline channel diagnostics (%s): std_mean_by_channel=%s, ptp_mean_by_channel=%s",
+            dataset.eeg_units,
             _channel_stat_map(model_ch_names, train_ch_std_mean),
             _channel_stat_map(model_ch_names, train_ch_ptp_mean),
         )
@@ -312,7 +317,8 @@ def run_task(fname: str):
                 class_ch_std_mean = np.mean(train_ch_std[class_mask], axis=0)
                 class_ch_ptp_mean = np.mean(train_ch_ptp[class_mask], axis=0)
                 logger.info(
-                    "Offline channel diagnostics by class: code=%d, std_mean_by_channel=%s, ptp_mean_by_channel=%s",
+                    "Offline channel diagnostics by class (%s): code=%d, std_mean_by_channel=%s, ptp_mean_by_channel=%s",
+                    dataset.eeg_units,
                     int(code),
                     _channel_stat_map(model_ch_names, class_ch_std_mean),
                     _channel_stat_map(model_ch_names, class_ch_ptp_mean),
@@ -348,6 +354,8 @@ def run_task(fname: str):
             pickle.dump(
                 {
                     "channel_names": list(model_ch_names),
+                    "eeg_units": dataset.eeg_units,
+                    "offline_scale_applied": dataset.offline_scale_applied,
                     "classifier_classes": classifier_classes.tolist(),
                     "train_feature_mean": train_feature_mean,
                     "train_feature_std": train_feature_std,
@@ -518,7 +526,7 @@ def run_task(fname: str):
                         accepted_right_probs.append(float(prob_map[int(stim_cfg.right_code)]))
                         logger.info(
                             "Decode %d: fresh_window=%s, new_samples_since_last_decode=%d, total_samples=%d, "
-                            "window_mean=%.3f, window_std=%.3f, window_ptp=%.3f, end_ts=%s, predicted_code=%d, "
+                            "window_mean=%.3f %s, window_std=%.3f %s, window_ptp=%.3f %s, end_ts=%s, predicted_code=%d, "
                             "decision_raw=%.6f, feature_z_l2=%.3f, probs_by_code=%s, centroid_dists=%s, "
                             "ch_std_top_deviation=%s, ch_ptp_top_deviation=%s",
                             prediction_count,
@@ -526,8 +534,11 @@ def run_task(fname: str):
                             samples_since_last_decode,
                             total_samples_appended,
                             window_mean,
+                            dataset.eeg_units,
                             window_std,
+                            dataset.eeg_units,
                             window_ptp,
+                            dataset.eeg_units,
                             "None" if decode_end_ts is None else f"{decode_end_ts:.6f}",
                             pred_code,
                             decision_raw,
@@ -554,11 +565,13 @@ def run_task(fname: str):
                         live_note = "artifact reject"
                         logger.warning(
                             "Decode skipped by artifact reject: new_samples_since_last_decode=%d, total_samples=%d, "
-                            "window_ptp=%.3f, threshold=%.3f, end_ts=%s, ch_ptp_by_channel=%s",
+                            "window_ptp=%.3f %s, threshold=%.3f %s, end_ts=%s, ch_ptp_by_channel=%s",
                             samples_since_last_decode,
                             total_samples_appended,
                             window_ptp,
+                            dataset.eeg_units,
                             float(reject_thresh),
+                            dataset.eeg_units,
                             "None" if decode_end_ts is None else f"{decode_end_ts:.6f}",
                             _channel_stat_map(model_ch_names, window_ch_ptp),
                         )

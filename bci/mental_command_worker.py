@@ -193,6 +193,8 @@ class OfflineMIDataset:
     session_ids: np.ndarray
     sfreq: float
     channel_names: list[str]
+    eeg_units: str
+    offline_scale_applied: float
     n_files_found: int
     n_files_used: int
     n_trials: int
@@ -322,6 +324,7 @@ def load_offline_mi_dataset(
             )
 
         eeg_data = raw.get_data(picks=picks).astype(np.float32, copy=False)
+        eeg_data *= float(task_cfg.offline_eeg_scale_to_match_live)
         eeg_data_filt = filter_session(
             block=eeg_data,
             eeg_cfg=eeg_cfg,
@@ -378,6 +381,8 @@ def load_offline_mi_dataset(
         session_ids=session_ids,
         sfreq=float(target_sfreq),
         channel_names=[str(name) for name in target_channel_names],
+        eeg_units=str(task_cfg.live_eeg_units),
+        offline_scale_applied=float(task_cfg.offline_eeg_scale_to_match_live),
         n_files_found=len(edf_paths),
         n_files_used=n_files_used,
         n_trials=n_trials,

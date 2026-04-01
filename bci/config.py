@@ -125,6 +125,13 @@ class MentalCommandTaskConfig:
     data_dir: str = ""
     edf_glob: str = "*.edf"
 
+    # MNE EDF readers typically return EEG in volts, while the live DSI/LSL
+    # stream is exposed in microvolts. Scale offline data into the live units
+    # before filtering and windowing so artifact thresholds and covariance
+    # structure are comparable online vs offline.
+    offline_eeg_scale_to_match_live: float = 1e6
+    live_eeg_units: str = "uV"
+
     # Each cued MI execution epoch is 3 seconds long in the offline task.
     epoch_duration_s: float = 3.0
 
