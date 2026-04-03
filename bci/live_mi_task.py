@@ -190,7 +190,7 @@ def run_task(
     sfreq = 300.0
 
     stream = StreamLSL(
-        bufsize=max(30.0, task_cfg.live_duration_s + 10.0),
+        bufsize=max(30.0, eeg_cfg.tmax + 10.0),
         name=lsl_cfg.name,
         stype=lsl_cfg.stype,
         source_id=lsl_cfg.source_id,
@@ -208,6 +208,9 @@ def run_task(
         model_ch_names = [ch for ch in available if canonicalize_channel_name(ch) != event_key]
     if len(model_ch_names) < 2:
         raise RuntimeError(f"Need >=2 EEG channels, found: {available}")
+    
+    stream.pick(available)
+    stream.set_channel_types({lsl_cfg.event_channels: "stim"})
 
     epochs_online = EpochsStream(
         stream,
@@ -327,13 +330,13 @@ def run_task(
             eeg_cfg.h_freq,
             task_cfg.filter_context_s,
         )
-        cue_text = "Preparing model from offline EDF sessions..."
-        status_text = (
+        cue_text.text = "Preparing model from offline EDF sessions..."
+        status_text.text = (
             f"Loading data from {task_cfg.data_dir}\n"
             "Offline EDFs are standardized to the live stream convention: left-ear referenced, standard channel names,\n"
             "then causally filtered as full sessions before epoching/windowing to match live streaming."
         )
-        detected_text = ""
+        detected_text.text = ""
 
         dataset = load_offline_mi_dataset(
             data_dir=task_cfg.data_dir,
@@ -418,8 +421,8 @@ def run_task(
             session_lines.append(f"S{session_id}: {score:.3f}")
         session_summary = "  ".join(session_lines) if session_lines else "No valid held-out sessions"
 
-        cue_text = "Model ready"
-        status_text = (
+        cue_text.text = "Model ready"
+        status_text.text = (
             f"Files used: {dataset.n_files_used}/{dataset.n_files_found}  "
             f"Trials: {dataset.n_trials}  Windows: {dataset.n_windows}\n"
             f"{label_cfg.left_name}: {counts[int(stim_cfg.left_code)]}  "
@@ -429,7 +432,7 @@ def run_task(
             "Press SPACE to start live task. ESC to quit."
         )
 
-        detected_text = (
+        detected_text.text = (
             f"Window={task_cfg.window_s:.1f}s  "
             f"Step={task_cfg.window_step_s:.2f}s  "
             f"Filter={eeg_cfg.l_freq:.1f}-{eeg_cfg.h_freq:.1f} Hz"
@@ -438,8 +441,8 @@ def run_task(
 
         # I skipped the calibration block, if needed it should be added here
 
-        X_live = list[np.ndarray] = []
-        y_live = list[int] = []
+        X_live = []
+        y_live = []
 
         scheduler = BalancedBlockScheduler(
             block_size=max(2, task_cfg.max_trials_before_break),
@@ -546,8 +549,8 @@ def run_task(
             prep_arrow.vertices = _ARROW_VERTS_LEFT if pred_code == left else _ARROW_VERTS_RIGHT
             prep_arrow.opacity = 1
 
-            cue_text = ""
-            status_text = (
+            cue_text.text = ""
+            status_text.text = (
                     f"Live Trial {live_idx + 1}/{task_cfg.n_live_trials} | "
                     f"Accuracy: {correct_count}/{live_idx}"
                 )
@@ -584,6 +587,7 @@ def run_task(
         # ---- Cleanup ----
         raw_recorder.stop()
 
+        '''
         # Save epoch data + final CV
         if len(y_live) > 0:
             X_save = np.stack(X_live, axis=0)
@@ -593,6 +597,7 @@ def run_task(
             print(f"[SAVE] {X_save.shape[0]} epochs -> {fname}_data.npy")
 
             # to be added: either predict on the live dataset using the pre-trained classifier or train on live data as well and predict on live data
+        '''
         trig.close()
         for resource in [epochs_online, stream]:
             try:
