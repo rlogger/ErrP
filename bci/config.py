@@ -117,6 +117,7 @@ class SessionConfig:
 class MentalCommandLabelConfig:
     left_name: str = "LEFT"
     right_name: str = "RIGHT"
+    rest_name: str = "REST"
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,33 @@ class MentalCommandTaskConfig:
 
     # Continuous live feedback settings.
     live_update_interval_s: float = 0.50
+
+    # If True, collect a short relaxed baseline at startup and add it as a
+    # third REST class to the classifier.
+    enable_online_rest_calibration: bool = False
+    # Internal label used for the optional REST class. This is only for the
+    # classifier and is never sent as a hardware trigger.
+    rest_class_code: int = 99
+    # Duration of the relaxed baseline collection before the live task.
+    rest_calibration_duration_s: float = 20.0
+
+    # If True, collect short live LEFT/RIGHT sustained MI blocks at startup
+    # and add them as one additional session in LOSO and final fitting.
+    enable_online_lr_calibration: bool = False
+    # Number of sustained live calibration blocks to collect per class.
+    online_lr_calibration_reps_per_class: int = 4
+    # Preparation time before each live LEFT/RIGHT calibration block.
+    online_lr_calibration_prep_s: float = 2.0
+    # Sustained imagery duration for each live LEFT/RIGHT calibration block.
+    online_lr_calibration_hold_s: float = 8.0
+    # Rest interval between live LEFT/RIGHT calibration blocks.
+    online_lr_calibration_iti_s: float = 2.0
+
+    # If True, add a fixed signed offset to the live right-left command.
+    enable_live_bias_offset: bool = False
+    # Signed command offset added to (p_right - p_left). Positive favors
+    # RIGHT, negative favors LEFT.
+    live_bias_offset: float = 0.0
 
     # Visualization runtime.
     live_duration_s: float = 180.0
@@ -179,6 +207,33 @@ class MICursorTaskConfig:
     # Increase `live_update_interval_s` for fewer, calmer updates.
     # Decrease it for more responsive but potentially twitchier control.
     live_update_interval_s: float = 0.10
+
+    # If True, collect a short relaxed baseline at startup and add it as a
+    # third REST class to the classifier.
+    enable_online_rest_calibration: bool = False
+    # Internal label used for the optional REST class. This is only for the
+    # classifier and is never sent as a hardware trigger.
+    rest_class_code: int = 99
+    # Duration of the relaxed baseline collection before the live task.
+    rest_calibration_duration_s: float = 20.0
+
+    # If True, collect short live LEFT/RIGHT sustained MI blocks at startup
+    # and add them as one additional session in LOSO and final fitting.
+    enable_online_lr_calibration: bool = False
+    # Number of sustained live calibration blocks to collect per class.
+    online_lr_calibration_reps_per_class: int = 4
+    # Preparation time before each live LEFT/RIGHT calibration block.
+    online_lr_calibration_prep_s: float = 2.0
+    # Sustained imagery duration for each live LEFT/RIGHT calibration block.
+    online_lr_calibration_hold_s: float = 8.0
+    # Rest interval between live LEFT/RIGHT calibration blocks.
+    online_lr_calibration_iti_s: float = 2.0
+
+    # If True, add a fixed signed offset to the live right-left command.
+    enable_live_bias_offset: bool = False
+    # Signed command offset added to (p_right - p_left). Positive favors
+    # RIGHT, negative favors LEFT.
+    live_bias_offset: float = 0.0
 
     # Window / display settings.
     fullscreen: bool = False

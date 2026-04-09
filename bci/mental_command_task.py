@@ -13,10 +13,12 @@ from mne_lsl.stream import StreamLSL
 from config import EEGConfig, LSLConfig, MentalCommandLabelConfig, MentalCommandModelConfig, MentalCommandTaskConfig, StimConfig
 from mental_command_worker import (
     StreamingIIRFilter,
+    append_windows_to_dataset,
     canonicalize_channel_name,
     evaluate_loso_sessions,
     load_offline_mi_dataset,
     make_mi_classifier,
+    prepare_continuous_windows,
     resolve_channel_order,
 )
 
@@ -194,6 +196,26 @@ def run_task(fname: str):
             if "escape" in keys:
                 raise KeyboardInterrupt
 
+    def collect_stream_block(duration_s: float) -> np.ndarray:
+        chunks: list[np.ndarray] = []
+        last_ts_local: float | None = None
+        clock = core.Clock()
+        while clock.getTime() < duration_s:
+            if "escape" in event.getKeys():
+                raise KeyboardInterrupt
+            data, ts = stream.get_data(winsize=min(0.25, duration_s), picks="all")
+            if data.size > 0 and ts is not None and len(ts) > 0:
+                ts_arr = np.asarray(ts)
+                mask = np.ones_like(ts_arr, dtype=bool) if last_ts_local is None else (ts_arr > float(last_ts_local))
+                if np.any(mask):
+                    x_new = np.asarray(data[:, mask], dtype=np.float32)
+                    last_ts_local = float(ts_arr[mask][-1])
+                    chunks.append(x_new)
+            draw_frame()
+        if not chunks:
+            return np.empty((len(model_ch_names), 0), dtype=np.float32)
+        return np.concatenate(chunks, axis=1).astype(np.float32, copy=False)
+
     classifier = None
     class_index = None
     classifier_classes = None
@@ -206,6 +228,9 @@ def run_task(fname: str):
     train_ch_ptp_mean = None
     train_ch_ptp_std = None
     dataset = None
+    rest_session_id: int | None = None
+    online_cal_session_id: int | None = None
+    train_only_session_ids: set[int] = set()
     reject_thresh = eeg_cfg.reject_peak_to_peak
     window_n = int(round(task_cfg.window_s * sfreq))
 
@@ -242,15 +267,151 @@ def run_task(fname: str):
             target_sfreq=sfreq,
             target_channel_names=model_ch_names,
         )
+
+        if bool(task_cfg.enable_online_rest_calibration):
+            cue.text = "Rest calibration"
+            status.text = (
+                "Sit in your motor imagery position, keep both hands relaxed,\n"
+                "and look at the center while we record a short REST baseline.\n\n"
+                "Press SPACE to begin. ESC to quit."
+            )
+            detected.text = ""
+            update_bar(0.0)
+            wait_for_space()
+            cue.text = "REST baseline"
+            status.text = (
+                f"Relax both hands and keep your gaze centered for {task_cfg.rest_calibration_duration_s:.0f}s."
+            )
+            draw_frame()
+            rest_block = collect_stream_block(float(task_cfg.rest_calibration_duration_s))
+            rest_windows = prepare_continuous_windows(
+                raw_block=rest_block,
+                eeg_cfg=eeg_cfg,
+                sfreq=sfreq,
+                window_s=float(task_cfg.window_s),
+                step_s=float(task_cfg.window_step_s),
+                reject_peak_to_peak=reject_thresh,
+            )
+            if rest_windows.shape[0] > 0:
+                rest_session_id = -1
+                train_only_session_ids.add(rest_session_id)
+                rest_labels = np.full(rest_windows.shape[0], int(task_cfg.rest_class_code), dtype=int)
+                dataset = append_windows_to_dataset(
+                    dataset=dataset,
+                    windows=rest_windows,
+                    labels=rest_labels,
+                    session_id=rest_session_id,
+                    n_trials_add=1,
+                )
+                logger.info(
+                    "Collected online REST calibration: duration_s=%.3f, raw_samples=%d, windows=%d, session_id=%d",
+                    float(task_cfg.rest_calibration_duration_s),
+                    int(rest_block.shape[1]),
+                    int(rest_windows.shape[0]),
+                    rest_session_id,
+                )
+            else:
+                logger.warning("REST calibration produced no usable windows after preprocessing/rejection.")
+
+        if bool(task_cfg.enable_online_lr_calibration):
+            cue.text = "Live LEFT/RIGHT calibration"
+            status.text = (
+                "We will collect a few sustained live LEFT and RIGHT imagery blocks.\n"
+                "Prepare when cued, then sustain the imagery for the whole block.\n\n"
+                "Press SPACE to begin. ESC to quit."
+            )
+            detected.text = ""
+            update_bar(0.0)
+            wait_for_space()
+
+            online_cal_session_id = int(np.max(dataset.session_ids)) + 1
+            cal_windows: list[np.ndarray] = []
+            cal_labels: list[np.ndarray] = []
+            cal_codes = (
+                [int(stim_cfg.left_code)] * int(task_cfg.online_lr_calibration_reps_per_class)
+                + [int(stim_cfg.right_code)] * int(task_cfg.online_lr_calibration_reps_per_class)
+            )
+            rng = np.random.default_rng()
+            rng.shuffle(cal_codes)
+
+            for cal_idx, code in enumerate(cal_codes, start=1):
+                class_name = label_cfg.left_name if int(code) == int(stim_cfg.left_code) else label_cfg.right_name
+                cue.text = "Prepare"
+                status.text = (
+                    f"Live calibration {cal_idx}/{len(cal_codes)}\n"
+                    f"Get ready for {class_name} motor imagery."
+                )
+                detected.text = ""
+                draw_frame()
+                prep_clock = core.Clock()
+                while prep_clock.getTime() < float(task_cfg.online_lr_calibration_prep_s):
+                    if "escape" in event.getKeys():
+                        raise KeyboardInterrupt
+                    draw_frame()
+
+                cue.text = f"SUSTAIN {class_name}"
+                status.text = f"Hold {class_name} motor imagery for {task_cfg.online_lr_calibration_hold_s:.0f}s."
+                draw_frame()
+                cal_block = collect_stream_block(float(task_cfg.online_lr_calibration_hold_s))
+                windows = prepare_continuous_windows(
+                    raw_block=cal_block,
+                    eeg_cfg=eeg_cfg,
+                    sfreq=sfreq,
+                    window_s=float(task_cfg.window_s),
+                    step_s=float(task_cfg.window_step_s),
+                    reject_peak_to_peak=reject_thresh,
+                )
+                if windows.shape[0] > 0:
+                    cal_windows.append(windows)
+                    cal_labels.append(np.full(windows.shape[0], int(code), dtype=int))
+                logger.info(
+                    "Collected live LR calibration block: idx=%d, code=%d, raw_samples=%d, windows=%d",
+                    cal_idx,
+                    int(code),
+                    int(cal_block.shape[1]),
+                    int(windows.shape[0]),
+                )
+
+                cue.text = ""
+                status.text = "Relax"
+                draw_frame()
+                iti_clock = core.Clock()
+                while iti_clock.getTime() < float(task_cfg.online_lr_calibration_iti_s):
+                    if "escape" in event.getKeys():
+                        raise KeyboardInterrupt
+                    draw_frame()
+
+            if cal_windows:
+                X_online = np.concatenate(cal_windows, axis=0).astype(np.float32, copy=False)
+                y_online = np.concatenate(cal_labels, axis=0).astype(int, copy=False)
+                dataset = append_windows_to_dataset(
+                    dataset=dataset,
+                    windows=X_online,
+                    labels=y_online,
+                    session_id=online_cal_session_id,
+                    n_trials_add=len(cal_codes),
+                )
+                logger.info(
+                    "Added live LEFT/RIGHT calibration session: session_id=%d, windows=%d, trials=%d",
+                    online_cal_session_id,
+                    int(X_online.shape[0]),
+                    len(cal_codes),
+                )
+            else:
+                logger.warning("Live LEFT/RIGHT calibration produced no usable windows after preprocessing/rejection.")
+
         classes_present = {int(c) for c in np.unique(dataset.y)}
         expected_classes = {int(stim_cfg.left_code), int(stim_cfg.right_code)}
-        if classes_present != expected_classes:
+        if bool(task_cfg.enable_online_rest_calibration) and rest_session_id is not None:
+            expected_classes.add(int(task_cfg.rest_class_code))
+        missing_classes = expected_classes.difference(classes_present)
+        if missing_classes:
             raise RuntimeError(
-                f"Training data must contain both left/right classes. "
-                f"Found {sorted(classes_present)}, expected {sorted(expected_classes)}."
+                f"Training data are missing required classes. Found {sorted(classes_present)}, "
+                f"expected at least {sorted(expected_classes)}."
             )
 
-        loso = evaluate_loso_sessions(dataset, model_cfg)
+        loso = evaluate_loso_sessions(dataset, model_cfg, train_only_session_ids=train_only_session_ids)
         classifier = make_mi_classifier(model_cfg)
         classifier.fit(dataset.X, dataset.y)
         classifier_classes = np.asarray(classifier.named_steps["clf"].classes_, dtype=int)
@@ -277,7 +438,8 @@ def run_task(fname: str):
         train_ch_ptp_std = np.std(train_ch_ptp, axis=0)
         logger.info(
             "Offline dataset ready: files_used=%d/%d, trials=%d, windows=%d, class_counts=%s, "
-            "loso_mean=%.4f, loso_std=%.4f, eeg_units=%s, offline_scale_applied=%.3f",
+            "loso_mean=%.4f, loso_std=%.4f, eeg_units=%s, offline_scale_applied=%.3f, "
+            "train_only_session_ids=%s, online_cal_session_id=%s",
             dataset.n_files_used,
             dataset.n_files_found,
             dataset.n_trials,
@@ -287,15 +449,19 @@ def run_task(fname: str):
             loso.std_accuracy,
             dataset.eeg_units,
             dataset.offline_scale_applied,
+            sorted(train_only_session_ids),
+            online_cal_session_id,
         )
         logger.info(
-            "Classifier class order: classes=%s, class_index=%s, left_code=%d -> prob_index=%d, right_code=%d -> prob_index=%d",
+            "Classifier class order: classes=%s, class_index=%s, left_code=%d -> prob_index=%d, right_code=%d -> prob_index=%d, rest_code=%d -> prob_index=%s",
             classifier_classes.tolist(),
             class_index,
             int(stim_cfg.left_code),
             class_index[int(stim_cfg.left_code)],
             int(stim_cfg.right_code),
             class_index[int(stim_cfg.right_code)],
+            int(task_cfg.rest_class_code),
+            class_index.get(int(task_cfg.rest_class_code)),
         )
         train_pred = classifier.predict(dataset.X)
         train_acc = float(np.mean(train_pred == dataset.y))
@@ -345,7 +511,10 @@ def run_task(fname: str):
                     centroid_norm,
                 )
         for session_id, score in sorted(loso.session_scores.items()):
-            logger.info("LOSO session result: session=%d accuracy=%.4f", session_id, score)
+            session_name = f"session={session_id}"
+            if online_cal_session_id is not None and int(session_id) == int(online_cal_session_id):
+                session_name = "session=online_lr_calibration"
+            logger.info("LOSO session result: %s accuracy=%.4f", session_name, score)
         np.save(f"{fname}_mi_visualizer_windows.npy", dataset.X)
         np.save(f"{fname}_mi_visualizer_labels.npy", dataset.y)
         with open(f"{fname}_mi_visualizer_model.pkl", "wb") as fh:
@@ -370,15 +539,22 @@ def run_task(fname: str):
 
         session_lines = []
         for session_id, score in sorted(loso.session_scores.items()):
-            session_lines.append(f"S{session_id}: {score:.3f}")
+            if online_cal_session_id is not None and int(session_id) == int(online_cal_session_id):
+                session_lines.append(f"OnlineCal: {score:.3f}")
+            else:
+                session_lines.append(f"S{session_id}: {score:.3f}")
         session_summary = "  ".join(session_lines) if session_lines else "No valid held-out sessions"
+        rest_count_text = ""
+        if int(task_cfg.rest_class_code) in counts:
+            rest_count_text = f"  {label_cfg.rest_name}: {counts[int(task_cfg.rest_class_code)]}"
 
         cue.text = "Model ready"
         status.text = (
             f"Files used: {dataset.n_files_used}/{dataset.n_files_found}  "
             f"Trials: {dataset.n_trials}  Windows: {dataset.n_windows}\n"
             f"{label_cfg.left_name}: {counts[int(stim_cfg.left_code)]}  "
-            f"{label_cfg.right_name}: {counts[int(stim_cfg.right_code)]}\n"
+            f"{label_cfg.right_name}: {counts[int(stim_cfg.right_code)]}"
+            f"{rest_count_text}\n"
             f"LOSO mean={loso.mean_accuracy:.3f} std={loso.std_accuracy:.3f}\n"
             f"{session_summary}\n"
             "Press SPACE to start live feedback. ESC to quit."
@@ -401,7 +577,7 @@ def run_task(fname: str):
 
         pred_clock = core.Clock()
         session_clock = core.Clock()
-        p_vec = np.array([0.5, 0.5], dtype=np.float64)
+        p_vec = np.full(len(classifier_classes), 1.0 / max(len(classifier_classes), 1), dtype=np.float64)
         prediction_count = 0
         live_note = "warming up"
         last_logged_visualized_state: tuple[float, float, float, int, str] | None = None
@@ -413,6 +589,7 @@ def run_task(fname: str):
         accepted_feature_zscores: list[float] = []
         accepted_right_probs: list[float] = []
         accepted_left_probs: list[float] = []
+        bias_offset = float(task_cfg.live_bias_offset) if bool(task_cfg.enable_live_bias_offset) else 0.0
 
         live_filter = StreamingIIRFilter.from_eeg_config(
             eeg_cfg=eeg_cfg,
@@ -496,7 +673,6 @@ def run_task(fname: str):
                         x_feat = np.asarray(feature_extractor.transform(x_win[np.newaxis, ...])[0], dtype=np.float64)
                         p_vec = classifier.predict_proba(x_win[np.newaxis, ...])[0]
                         pred_code = int(classifier.predict(x_win[np.newaxis, ...])[0])
-                        decision_raw = float(np.ravel(classifier.decision_function(x_win[np.newaxis, ...]))[0])
                         prob_map = {
                             int(cls): float(p_vec[idx])
                             for idx, cls in enumerate(classifier_classes.tolist())
@@ -527,7 +703,7 @@ def run_task(fname: str):
                         logger.info(
                             "Decode %d: fresh_window=%s, new_samples_since_last_decode=%d, total_samples=%d, "
                             "window_mean=%.3f %s, window_std=%.3f %s, window_ptp=%.3f %s, end_ts=%s, predicted_code=%d, "
-                            "decision_raw=%.6f, feature_z_l2=%.3f, probs_by_code=%s, centroid_dists=%s, "
+                            "lr_margin_raw=%.6f, lr_margin_biased=%.6f, feature_z_l2=%.3f, probs_by_code=%s, centroid_dists=%s, "
                             "ch_std_top_deviation=%s, ch_ptp_top_deviation=%s",
                             prediction_count,
                             is_fresh_window,
@@ -541,7 +717,8 @@ def run_task(fname: str):
                             dataset.eeg_units,
                             "None" if decode_end_ts is None else f"{decode_end_ts:.6f}",
                             pred_code,
-                            decision_raw,
+                            float(prob_map.get(int(stim_cfg.right_code), 0.0) - prob_map.get(int(stim_cfg.left_code), 0.0)),
+                            float(prob_map.get(int(stim_cfg.right_code), 0.0) - prob_map.get(int(stim_cfg.left_code), 0.0) + bias_offset),
                             feature_z_l2,
                             prob_map,
                             centroid_dist_map,
@@ -588,32 +765,46 @@ def run_task(fname: str):
 
             left_p = float(p_vec[class_index[int(stim_cfg.left_code)]])
             right_p = float(p_vec[class_index[int(stim_cfg.right_code)]])
-            signed_score = right_p - left_p
+            rest_p = (
+                float(p_vec[class_index[int(task_cfg.rest_class_code)]])
+                if int(task_cfg.rest_class_code) in class_index
+                else 0.0
+            )
+            signed_score = right_p - left_p + bias_offset
             update_bar(signed_score)
             visualized_state = (
                 round(left_p, 6),
                 round(right_p, 6),
+                round(rest_p, 6),
                 round(signed_score, 6),
                 int(prediction_count),
                 str(live_note),
             )
             if visualized_state != last_logged_visualized_state:
                 logger.info(
-                    "Visualized state: left_p=%.4f, right_p=%.4f, signed_score=%.4f, prediction_count=%d, note=%s",
+                    "Visualized state: left_p=%.4f, right_p=%.4f, rest_p=%.4f, signed_score=%.4f, bias_offset=%.4f, prediction_count=%d, note=%s",
                     left_p,
                     right_p,
+                    rest_p,
                     signed_score,
+                    bias_offset,
                     prediction_count,
                     live_note,
                 )
                 last_logged_visualized_state = visualized_state
-            detected.text = (
-                f"{label_cfg.left_name}: {left_p:.2f}   "
-                f"{label_cfg.right_name}: {right_p:.2f}   "
-                f"margin={signed_score:+.2f}   "
-                f"updates={prediction_count}   "
-                f"{live_note}"
-            )
+            detected_parts = [
+                f"{label_cfg.left_name}: {left_p:.2f}",
+                f"{label_cfg.right_name}: {right_p:.2f}",
+            ]
+            if int(task_cfg.rest_class_code) in class_index:
+                detected_parts.append(f"{label_cfg.rest_name}: {rest_p:.2f}")
+            detected_parts.extend([
+                f"margin={signed_score:+.2f}",
+                f"bias={bias_offset:+.2f}",
+                f"updates={prediction_count}",
+                f"{live_note}",
+            ])
+            detected.text = "   ".join(detected_parts)
             draw_frame()
 
         cue.text = "Live session complete"
