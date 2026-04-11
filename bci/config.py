@@ -178,6 +178,10 @@ class MentalCommandTaskConfig:
     # Visualization runtime.
     live_duration_s: float = 180.0
 
+    # Kalman Filter Stuff
+    activate_kf: bool = False
+    make_kf_adaptive: bool = True
+
 
 @dataclass(frozen=True)
 class MICursorTaskConfig:
