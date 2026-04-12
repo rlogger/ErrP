@@ -285,6 +285,7 @@ def load_offline_mi_dataset(
     stim_cfg: StimConfig,
     target_sfreq: float,
     target_channel_names: list[str] | tuple[str, ...],
+    calibrateOnParticipant: str
 ) -> OfflineMIDataset:
     data_path = Path(data_dir).expanduser()
     edf_paths = sorted(data_path.rglob(edf_glob))
@@ -303,6 +304,9 @@ def load_offline_mi_dataset(
     n_files_used = 0
 
     for session_id, edf_path in enumerate(edf_paths):
+        if calibrateOnParticipant not in edf_path:
+            continue
+        print(edf_path)
         raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
         raw = standardize_offline_raw(raw)
         stim_channel = find_stim_channel(raw)

@@ -93,8 +93,9 @@ def _sample_target( # altered to generate a target region for the knob instead
     prev_target: float
 ) -> np.ndarray:
     for _ in range(1000):
-        candidate = rng.uniform(0, 2*np.pi)
-        if float(np.linalg.norm(candidate - prev_target)) >= min_distance:
+        candidate = rng.uniform(-np.pi, np.pi)
+        dist = abs((candidate - prev_target + math.pi) % (2 * math.pi) - math.pi)
+        if dist >= min_distance:
             return [candidate - radius, candidate + radius]
     raise RuntimeError("Failed to sample a valid target location.")
 
@@ -608,7 +609,7 @@ def run_task(fname: str) -> None:
                     heading_rad + math.radians(task_cfg.rotation_speed) * steering_state * dt
                 )
 
-                heading_line.ori = math.degrees(heading_rad)
+                # heading_line.ori = math.degrees(heading_rad)
 
                 _update_knob_visual()
 
@@ -616,8 +617,9 @@ def run_task(fname: str) -> None:
                 mean_raw_command_sum += raw_command
                 command_samples += 1
 
-                distance_to_target_region = np.min(np.abs(target_pos[0] - heading_rad), np.abs(target_pos[1] - heading_rad))
-                target_region_reached = (target_pos[0] <= heading_rad <= target_pos[1]) or (target_pos[0] >= heading_rad >= target_pos[1])
+                target_center = (target_pos[0] + target_pos[1]) / 2.0
+                angular_dist_to_center = abs((heading_rad - target_center + math.pi) % (2 * math.pi) - math.pi)
+                target_region_reached = angular_dist_to_center <= task_cfg.knob_radius
 
                 cue.text = f"Trial {completed_trials + 1}"
                 parts = [

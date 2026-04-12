@@ -282,6 +282,8 @@ class MICursorTaskConfig:
     # Decrease it for quicker but potentially more abrupt steering.
     steering_time_constant_s: float = 0.35
 
+    calirate_on_participant: str = "andy"
+
 @dataclass(frozen=True)
 class LiveMITaskConfig:
     # Folder of cued MI EDF sessions used to fit the live model at startup.
