@@ -208,7 +208,7 @@ def run_task(fname: str) -> None:
 
     target_region = visual.ShapeStim(
         win, 
-        vertices=[target_region_vertices], 
+        vertices=target_region_vertices, 
         fillColor=[0, 0.5, 0],   # Dark green
         lineColor=None,
         opacity=0.6
@@ -227,6 +227,7 @@ def run_task(fname: str) -> None:
 
     def _draw_frame() -> None:
         arena_outline.draw()
+        target_region.draw()
         heading_line.draw()
         knob.draw()
         title.draw()
@@ -613,8 +614,9 @@ def run_task(fname: str) -> None:
                     blend = float(np.clip(dt / task_cfg.steering_time_constant_s, 0.0, 1.0))
                     steering_state += (command_drive - steering_state) * blend
 
+                turn_rate_rad_s = task_cfg.max_turn_rate_deg_s
                 heading_rad = _wrap_angle(
-                    heading_rad + math.radians(task_cfg.rotation_speed) * steering_state * dt
+                    heading_rad + math.radians(turn_rate_rad_s) * steering_state * dt
                 )
 
                 # heading_line.ori = math.degrees(heading_rad)

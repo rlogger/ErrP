@@ -773,13 +773,12 @@ def run_task(fname: str):
                 else 0.0
             )
 
-            l2_dist = accepted_feature_zscores[-1]
-            r_adaptive = 0.1 * (1.0 + (l2_dist / 10.0)**2)
-
             signed_score = right_p - left_p + bias_offset
 
             # run signed score through KF to smooth it
-            if task_cfg.activate_kf:
+            if task_cfg.activate_kf and len(accepted_feature_zscores) > 0:
+                l2_dist = accepted_feature_zscores[-1]
+                r_adaptive = 0.1 * (1.0 + (l2_dist / 10.0)**2)
                 if task_cfg.make_kf_adaptive:
                     signed_score = kf.step(signed_score, r_adapted=r_adaptive)
                 else:
