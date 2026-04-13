@@ -107,7 +107,6 @@ def filter_session(block: np.ndarray, eeg_cfg: EEGConfig, sfreq: float) -> np.nd
     """
     return filter_block(block=block, eeg_cfg=eeg_cfg, sfreq=sfreq)
 
-
 def prepare_continuous_windows(
     raw_block: np.ndarray,
     eeg_cfg: EEGConfig,
@@ -136,6 +135,8 @@ def prepare_continuous_windows(
         keep_mask = np.ptp(windows, axis=-1).max(axis=1) <= float(reject_peak_to_peak)
         windows = windows[keep_mask]
     return windows.astype(np.float32, copy=False)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,7 @@ def load_offline_mi_dataset(
     stim_cfg: StimConfig,
     target_sfreq: float,
     target_channel_names: list[str] | tuple[str, ...],
+    calibrateOnParticipant: str
 ) -> OfflineMIDataset:
     data_path = Path(data_dir).expanduser()
     edf_paths = sorted(data_path.rglob(edf_glob))
@@ -333,6 +335,9 @@ def load_offline_mi_dataset(
     n_files_used = 0
 
     for session_id, edf_path in enumerate(edf_paths):
+        if calibrateOnParticipant not in str(edf_path):
+            continue
+        print(str(edf_path))
         raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
         raw = standardize_offline_raw(raw)
         stim_channel = find_stim_channel(raw)
@@ -459,42 +464,6 @@ def evaluate_loso_sessions(
         std_accuracy=std_accuracy,
     )
 
-
-def append_windows_to_dataset(
-    dataset: OfflineMIDataset,
-    windows: np.ndarray,
-    labels: np.ndarray,
-    session_id: int,
-    n_trials_add: int = 0,
-) -> OfflineMIDataset:
-    X_add = np.asarray(windows, dtype=np.float32)
-    y_add = np.asarray(labels, dtype=int)
-    if X_add.ndim != 3:
-        raise ValueError(f"Expected windows shape (n_windows, n_channels, n_samples), got {X_add.shape}")
-    if y_add.ndim != 1 or y_add.shape[0] != X_add.shape[0]:
-        raise ValueError(f"Expected labels shape ({X_add.shape[0]},), got {y_add.shape}")
-
-    if X_add.shape[0] == 0:
-        return dataset
-
-    session_add = np.full(X_add.shape[0], int(session_id), dtype=int)
-    X = np.concatenate((dataset.X, X_add), axis=0).astype(np.float32, copy=False)
-    y = np.concatenate((dataset.y, y_add), axis=0).astype(int, copy=False)
-    session_ids = np.concatenate((dataset.session_ids, session_add), axis=0).astype(int, copy=False)
-    return OfflineMIDataset(
-        X=X,
-        y=y,
-        session_ids=session_ids,
-        sfreq=float(dataset.sfreq),
-        channel_names=list(dataset.channel_names),
-        eeg_units=str(dataset.eeg_units),
-        offline_scale_applied=float(dataset.offline_scale_applied),
-        n_files_found=int(dataset.n_files_found),
-        n_files_used=int(dataset.n_files_used),
-        n_trials=int(dataset.n_trials) + int(n_trials_add),
-        n_windows=int(X.shape[0]),
-    )
-
 def load_dataset_for_live_task(
     data_dir: str,
     edf_glob: str,
@@ -611,3 +580,58 @@ def load_dataset_for_live_task(
         n_trials=n_trials,
         n_windows=int(X.shape[0]),
     )
+
+def append_windows_to_dataset(
+    dataset: OfflineMIDataset,
+    windows: np.ndarray,
+    labels: np.ndarray,
+    session_id: int,
+    n_trials_add: int = 0,
+) -> OfflineMIDataset:
+    X_add = np.asarray(windows, dtype=np.float32)
+    y_add = np.asarray(labels, dtype=int)
+    if X_add.ndim != 3:
+        raise ValueError(f"Expected windows shape (n_windows, n_channels, n_samples), got {X_add.shape}")
+    if y_add.ndim != 1 or y_add.shape[0] != X_add.shape[0]:
+        raise ValueError(f"Expected labels shape ({X_add.shape[0]},), got {y_add.shape}")
+
+    if X_add.shape[0] == 0:
+        return dataset
+
+    session_add = np.full(X_add.shape[0], int(session_id), dtype=int)
+    X = np.concatenate((dataset.X, X_add), axis=0).astype(np.float32, copy=False)
+    y = np.concatenate((dataset.y, y_add), axis=0).astype(int, copy=False)
+    session_ids = np.concatenate((dataset.session_ids, session_add), axis=0).astype(int, copy=False)
+    return OfflineMIDataset(
+        X=X,
+        y=y,
+        session_ids=session_ids,
+        sfreq=float(dataset.sfreq),
+        channel_names=list(dataset.channel_names),
+        eeg_units=str(dataset.eeg_units),
+        offline_scale_applied=float(dataset.offline_scale_applied),
+        n_files_found=int(dataset.n_files_found),
+        n_files_used=int(dataset.n_files_used),
+        n_trials=int(dataset.n_trials) + int(n_trials_add),
+        n_windows=int(X.shape[0]),
+    )
+
+
+# Kalman Filter Stuff
+class PostLDA_KalmanSmoother:
+    def __init__(self, q=0.005, r=0.1):
+        # kalman filters have matrix vars p, q, r, s; x represents state (in this case, the prediction- L/R)
+        self.x = 0.0
+        self.p = 1.0 # represents cov
+        self.q = q
+        self.r = r
+    
+    def step(self, z, r_adapted=False):
+        r_current = r_adapted if r_adapted is not None else self.r
+        self.p = self.p + self.q # make prediction about p
+
+        k = self.p / (self.p + r_current) # update k
+        self.x = self.x + k * (z - self.x)
+        self.p = (1 - k) * self.p
+        return self.x
+    

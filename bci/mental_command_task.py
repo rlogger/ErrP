@@ -20,6 +20,7 @@ from mental_command_worker import (
     make_mi_classifier,
     prepare_continuous_windows,
     resolve_channel_order,
+    PostLDA_KalmanSmoother
 )
 
 
@@ -74,7 +75,6 @@ def _top_channel_deviation_summary(
             "abs_z": round(float(z[int(idx)]), 6),
         })
     return summary
-
 
 def run_task(fname: str):
     logger = _make_task_logger(fname)
@@ -608,6 +608,8 @@ def run_task(fname: str):
             task_cfg.live_update_interval_s,
         )
 
+        kf = PostLDA_KalmanSmoother(q=0.02, r=0.1)
+
         while session_clock.getTime() < task_cfg.live_duration_s:
             if "escape" in event.getKeys():
                 raise KeyboardInterrupt
@@ -770,7 +772,18 @@ def run_task(fname: str):
                 if int(task_cfg.rest_class_code) in class_index
                 else 0.0
             )
+
             signed_score = right_p - left_p + bias_offset
+
+            # run signed score through KF to smooth it
+            if task_cfg.activate_kf and len(accepted_feature_zscores) > 0:
+                l2_dist = accepted_feature_zscores[-1]
+                r_adaptive = 0.1 * (1.0 + (l2_dist / 10.0)**2)
+                if task_cfg.make_kf_adaptive:
+                    signed_score = kf.step(signed_score, r_adapted=r_adaptive)
+                else:
+                    signed_score = kf.step(signed_score)
+
             update_bar(signed_score)
             visualized_state = (
                 round(left_p, 6),

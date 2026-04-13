@@ -16,7 +16,7 @@ from config import (
     LSLConfig,
     MentalCommandLabelConfig,
     MentalCommandModelConfig,
-    MICursorTaskConfig,
+    KnobTaskConfig,
     StimConfig,
 )
 from mental_command_worker import (
@@ -32,7 +32,7 @@ from mental_command_worker import (
 
 
 def _make_task_logger(fname: str) -> logging.Logger:
-    logger = logging.getLogger(f"lr_cursor.{fname}")
+    logger = logging.getLogger(f"mi_cursor.{fname}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if logger.handlers:
@@ -43,7 +43,7 @@ def _make_task_logger(fname: str) -> logging.Logger:
         datefmt="%H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(f"{fname}_lr_cursor.log", mode="w")
+    file_handler = logging.FileHandler(f"{fname}_mi_cursor.log", mode="w")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -61,7 +61,7 @@ def _sanitize_participant_name(raw_name: str) -> str:
 
 def _build_session_prefix(participant: str) -> str:
     date_prefix = datetime.now().strftime("%m_%d_%y")
-    return f"{date_prefix}_{participant}_lr_cursor"
+    return f"{date_prefix}_{participant}_knob_task"
 
 
 def _prompt_session_prefix() -> str:
@@ -86,30 +86,37 @@ def _apply_deadband(value: float, deadband: float) -> float:
     return float(math.copysign(scaled, value))
 
 
-def _sample_target(
+def _sample_target( # altered to generate a target region for the knob instead
     rng: np.random.Generator,
-    x_limit: float,
     min_distance: float,
+    radius: float,
+    prev_target: float
 ) -> np.ndarray:
     for _ in range(1000):
-        candidate = np.array(
-            [
-                rng.uniform(-x_limit, x_limit),
-                0,
-            ],
-            dtype=np.float64,
-        )
-        if float(np.linalg.norm(candidate)) >= min_distance:
-            return candidate
+        candidate = rng.uniform(-np.pi, np.pi)
+        dist = abs((candidate - prev_target + math.pi) % (2 * math.pi) - math.pi)
+        if dist >= min_distance:
+            return [candidate - radius, candidate + radius]
     raise RuntimeError("Failed to sample a valid target location.")
 
+def create_target_region(start_angle_rad: float, end_angle_rad: float, radius: float, num_points: int = 50):
+    vertices = [(0, 0)] # Start at center
+    step = (end_angle_rad - start_angle_rad) / (num_points - 1)
+    
+    for i in range(num_points):
+        angle = start_angle_rad + i * step
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        vertices.append((x, y))
+        
+    return vertices
 
 def run_task(fname: str) -> None:
     logger = _make_task_logger(fname)
     lsl_cfg = LSLConfig()
     stim_cfg = StimConfig()
     label_cfg = MentalCommandLabelConfig()
-    task_cfg = MICursorTaskConfig()
+    task_cfg = KnobTaskConfig()
     model_cfg = MentalCommandModelConfig()
     eeg_cfg = EEGConfig(
         picks=("Pz", "F4", "C4", "P4", "P3", "C3", "F3"),
@@ -155,20 +162,23 @@ def run_task(fname: str) -> None:
     )
 
     white = (0.90, 0.90, 0.90)
-    target_color = (0.96, 0.78, 0.24)
-    cursor_color = (0.38, 0.84, 0.95)
     accent = (0.88, 0.92, 0.96)
     success_color = (0.38, 0.92, 0.56)
 
-    arena_limit_x = 1.0 - float(task_cfg.arena_margin) - float(task_cfg.cursor_radius)
-    arena_limit_y = 1.0 - float(task_cfg.arena_margin) - float(task_cfg.cursor_radius)
-    target_limit_x = 1.0 - float(task_cfg.arena_margin) - float(task_cfg.target_radius)
-    target_limit_y = 1.0 - float(task_cfg.arena_margin) - float(task_cfg.target_radius)
+    # draw knob
+    knob = visual.Circle(
+        win, 
+        radius=task_cfg.knob_radius, 
+        fillColor=[0, 0, 0], 
+        lineColor=[0.5, 0.5, 0.5], 
+        lineWidth=3
+    )
 
-    title = visual.TextStim(win, text="Motor Imagery LR Cursor Control", pos=(0, 0.90), height=0.055, color=white)
+    title = visual.TextStim(win, text="Motor Imagery Knob Task", pos=(0, 0.90), height=0.055, color=white)
     cue = visual.TextStim(win, text="", pos=(0, 0.76), height=0.055, color=white)
     status = visual.TextStim(win, text="", pos=(0, -0.91), height=0.040, color=(0.84, 0.84, 0.84))
     info = visual.TextStim(win, text="", pos=(0, -0.82), height=0.040, color=accent)
+    
     arena_outline = visual.Rect(
         win,
         width=2.0 - 2.0 * task_cfg.arena_margin,
@@ -178,24 +188,7 @@ def run_task(fname: str) -> None:
         fillColor=None,
         lineWidth=1.5,
     )
-    target = visual.Circle(
-        win,
-        radius=task_cfg.target_radius,
-        edges=64,
-        pos=(0.0, 0.0),
-        fillColor=target_color,
-        lineColor=white,
-        lineWidth=1.5,
-    )
-    cursor = visual.Circle(
-        win,
-        radius=task_cfg.cursor_radius,
-        edges=64,
-        pos=(0.0, 0.0),
-        fillColor=cursor_color,
-        lineColor=white,
-        lineWidth=1.5,
-    )
+
     heading_line = visual.Line(
         win,
         start=(0.0, 0.0),
@@ -204,25 +197,39 @@ def run_task(fname: str) -> None:
         lineWidth=3.0,
     )
 
-    cursor_pos = np.zeros(2, dtype=np.float64)
-    heading_rad = math.pi / 2.0
-    steering_state = 0.0
-    target_pos = np.zeros(2, dtype=np.float64)
+    target_pos = _sample_target(
+            rng=rng,
+            min_distance=float(task_cfg.min_angular_distance),
+            radius=float(task_cfg.knob_radius),
+            prev_target=0.0
+        )
 
-    def _update_cursor_visual() -> None:
-        cursor.pos = (float(cursor_pos[0]), float(cursor_pos[1]))
-        nose_len = float(task_cfg.cursor_radius) * 2.3
-        heading_line.start = (float(cursor_pos[0]), float(cursor_pos[1]))
+    target_region_vertices = create_target_region(target_pos[0], target_pos[1], task_cfg.knob_radius, num_points=100) # change this 100 if necessary
+
+    target_region = visual.ShapeStim(
+        win, 
+        vertices=target_region_vertices, 
+        fillColor=[0, 0.5, 0],   # Dark green
+        lineColor=None,
+        opacity=0.6
+    )
+
+    heading_rad = task_cfg.start_angle
+    steering_state = 0.0
+
+    def _update_knob_visual() -> None:
+        nose_len = float(task_cfg.knob_radius) * 1.2 # the 1.2 can be altered, I just made it up
+        heading_line.start = (0.0, 0.0)
         heading_line.end = (
-            float(cursor_pos[0] + math.cos(heading_rad) * nose_len),
-            float(cursor_pos[1] + math.sin(heading_rad) * nose_len),
+            float(math.cos(heading_rad) * nose_len),
+            float(math.sin(heading_rad) * nose_len),
         )
 
     def _draw_frame() -> None:
         arena_outline.draw()
-        target.draw()
+        target_region.draw()
         heading_line.draw()
-        cursor.draw()
+        knob.draw()
         title.draw()
         cue.draw()
         info.draw()
@@ -230,11 +237,10 @@ def run_task(fname: str) -> None:
         win.flip()
 
     def _reset_trial_state() -> None:
-        nonlocal cursor_pos, heading_rad, steering_state
-        cursor_pos = np.zeros(2, dtype=np.float64)
-        heading_rad = math.pi / 2.0
+        nonlocal heading_rad, steering_state
+        heading_rad = task_cfg.start_angle
         steering_state = 0.0
-        _update_cursor_visual()
+        _update_knob_visual()
 
     def _wait_for_seconds(duration_s: float) -> None:
         clock = core.Clock()
@@ -296,7 +302,7 @@ def run_task(fname: str) -> None:
             stim_cfg=stim_cfg,
             target_sfreq=sfreq,
             target_channel_names=model_ch_names,
-            calibrateOnParticipant=task_cfg.calirate_on_participant
+            calibrateOnParticipant=""
         )
 
         if bool(task_cfg.enable_online_rest_calibration):
@@ -340,85 +346,6 @@ def run_task(fname: str) -> None:
             else:
                 logger.warning("REST calibration produced no usable windows after preprocessing/rejection.")
 
-        if bool(task_cfg.enable_online_lr_calibration):
-            cue.text = "Live LEFT/RIGHT calibration"
-            info.text = "We will collect a few sustained LEFT and RIGHT imagery blocks before the task."
-            status.text = "Press SPACE to begin. ESC to quit."
-            _draw_frame()
-            while True:
-                keys = event.getKeys()
-                if "escape" in keys:
-                    raise KeyboardInterrupt
-                if "space" in keys:
-                    break
-                _draw_frame()
-
-            online_cal_session_id = int(np.max(dataset.session_ids)) + 1
-            cal_codes = (
-                [int(stim_cfg.left_code)] * int(task_cfg.online_lr_calibration_reps_per_class)
-                + [int(stim_cfg.right_code)] * int(task_cfg.online_lr_calibration_reps_per_class)
-            )
-            rng.shuffle(cal_codes)
-            cal_windows: list[np.ndarray] = []
-            cal_labels: list[np.ndarray] = []
-
-            for cal_idx, code in enumerate(cal_codes, start=1):
-                class_name = label_cfg.left_name if int(code) == int(stim_cfg.left_code) else label_cfg.right_name
-                cue.text = "Prepare"
-                info.text = f"Get ready for {class_name} motor imagery."
-                status.text = f"Calibration block {cal_idx}/{len(cal_codes)}"
-                _draw_frame()
-                _wait_for_seconds(float(task_cfg.online_lr_calibration_prep_s))
-
-                cue.text = f"SUSTAIN {class_name}"
-                info.text = f"Hold {class_name} motor imagery for {task_cfg.online_lr_calibration_hold_s:.0f}s."
-                status.text = ""
-                _draw_frame()
-                cal_block = _collect_stream_block(float(task_cfg.online_lr_calibration_hold_s))
-                windows = prepare_continuous_windows(
-                    raw_block=cal_block,
-                    eeg_cfg=eeg_cfg,
-                    sfreq=sfreq,
-                    window_s=float(task_cfg.window_s),
-                    step_s=float(task_cfg.window_step_s),
-                    reject_peak_to_peak=eeg_cfg.reject_peak_to_peak,
-                )
-                if windows.shape[0] > 0:
-                    cal_windows.append(windows)
-                    cal_labels.append(np.full(windows.shape[0], int(code), dtype=int))
-                logger.info(
-                    "Collected live LR calibration block: idx=%d, code=%d, raw_samples=%d, windows=%d",
-                    cal_idx,
-                    int(code),
-                    int(cal_block.shape[1]),
-                    int(windows.shape[0]),
-                )
-
-                cue.text = ""
-                info.text = "Relax"
-                status.text = ""
-                _draw_frame()
-                _wait_for_seconds(float(task_cfg.online_lr_calibration_iti_s))
-
-            if cal_windows:
-                X_online = np.concatenate(cal_windows, axis=0).astype(np.float32, copy=False)
-                y_online = np.concatenate(cal_labels, axis=0).astype(int, copy=False)
-                dataset = append_windows_to_dataset(
-                    dataset=dataset,
-                    windows=X_online,
-                    labels=y_online,
-                    session_id=online_cal_session_id,
-                    n_trials_add=len(cal_codes),
-                )
-                logger.info(
-                    "Added live LEFT/RIGHT calibration session: session_id=%d, windows=%d, trials=%d",
-                    online_cal_session_id,
-                    int(X_online.shape[0]),
-                    len(cal_codes),
-                )
-            else:
-                logger.warning("Live LEFT/RIGHT calibration produced no usable windows after preprocessing/rejection.")
-
         classes_present = {int(c) for c in np.unique(dataset.y)}
         expected_classes = {int(stim_cfg.left_code), int(stim_cfg.right_code)}
         if bool(task_cfg.enable_online_rest_calibration) and rest_session_id is not None:
@@ -457,9 +384,9 @@ def run_task(fname: str) -> None:
             sorted(train_only_session_ids),
             online_cal_session_id,
         )
-        np.save(f"{fname}_lr_cursor_windows.npy", dataset.X)
-        np.save(f"{fname}_lr_cursor_labels.npy", dataset.y)
-        with open(f"{fname}_lr_cursor_model.pkl", "wb") as fh:
+        np.save(f"{fname}_mi_cursor_windows.npy", dataset.X)
+        np.save(f"{fname}_mi_cursor_labels.npy", dataset.y)
+        with open(f"{fname}_mi_cursor_model.pkl", "wb") as fh:
             pickle.dump(classifier, fh)
 
         session_lines = []
@@ -484,15 +411,19 @@ def run_task(fname: str) -> None:
             f"{rest_count_text}\n"
             f"{'  '.join(session_lines)}\n"
             "Press SPACE to start a target trial.\n"
-            f"Use {label_cfg.left_name}/{label_cfg.right_name} motor imagery to steer the cursor. ESC to quit."
+            f"Use {label_cfg.left_name}/{label_cfg.right_name} motor imagery to turn the knob and reach the target. ESC to quit."
         )
         _reset_trial_state()
         target_pos = _sample_target(
             rng=rng,
-            x_limit=target_limit_x,
-            min_distance=float(task_cfg.target_min_distance_from_center),
+            min_distance=float(task_cfg.min_angular_distance),
+            radius=float(task_cfg.knob_radius),
+            prev_target=target_pos
         )
-        target.pos = (float(target_pos[0]), float(target_pos[1]))
+
+        target_region_vertices = create_target_region(target_pos[0], target_pos[1], task_cfg.knob_radius, num_points=100) # change this 100 if necessary
+
+        target_region.vertices = target_region_vertices
         _draw_frame()
     except Exception:
         try:
@@ -525,12 +456,11 @@ def run_task(fname: str) -> None:
     raw_command = 0.0
     ema_command = 0.0
     live_note = "warming up"
-    latest_pred_code: int | None = None
     bias_offset = float(task_cfg.live_bias_offset) if bool(task_cfg.enable_live_bias_offset) else 0.0
 
     def _poll_live_decoder() -> None:
         nonlocal last_live_ts, live_buffer, prediction_count
-        nonlocal left_prob, right_prob, rest_prob, raw_command, ema_command, live_note, latest_pred_code
+        nonlocal left_prob, right_prob, rest_prob, raw_command, ema_command, live_note
 
         data, ts = stream.get_data(winsize=stream_pull_s, picks="all")
         if data.size > 0 and ts is not None and len(ts) > 0:
@@ -572,10 +502,6 @@ def run_task(fname: str) -> None:
             else 0.0
         )
         raw_command = float(np.clip(right_prob - left_prob + bias_offset, -1.0, 1.0))
-        if int(task_cfg.rest_class_code) in class_index and rest_prob >= max(left_prob, right_prob):
-            latest_pred_code = int(task_cfg.rest_class_code)
-        else:
-            latest_pred_code = int(stim_cfg.right_code) if raw_command >= 0.0 else int(stim_cfg.left_code)
         alpha = float(np.clip(task_cfg.command_ema_alpha, 0.0, 1.0))
         if prediction_count == 0:
             ema_command = raw_command
@@ -586,12 +512,11 @@ def run_task(fname: str) -> None:
 
         if prediction_count % 20 == 0:
             logger.info(
-                "Decode %d: left_p=%.4f, right_p=%.4f, rest_p=%.4f, pred_code=%s, raw_command=%.4f, ema_command=%.4f, bias_offset=%.4f",
+                "Decode %d: left_p=%.4f, right_p=%.4f, rest_p=%.4f, raw_command=%.4f, ema_command=%.4f, bias_offset=%.4f",
                 prediction_count,
                 left_prob,
                 right_prob,
                 rest_prob,
-                latest_pred_code,
                 raw_command,
                 ema_command,
                 bias_offset,
@@ -641,13 +566,14 @@ def run_task(fname: str) -> None:
     try:
         while True:
             _reset_trial_state()
-            target.fillColor = target_color
+            # target.fillColor = target_color
             target_pos = _sample_target(
                 rng=rng,
-                x_limit=target_limit_x,
-                min_distance=float(task_cfg.target_min_distance_from_center),
+                min_distance=float(task_cfg.min_angular_distance),
+                radius=task_cfg.knob_radius,
+                prev_target=float((target_pos[0] + target_pos[1])/2.0)
             )
-            target.pos = (float(target_pos[0]), float(target_pos[1]))
+            target_region.vertices = create_target_region(target_pos[0], target_pos[1], task_cfg.knob_radius, num_points=100)
             status.text = (
                 f"Trials completed: {completed_trials}\n"
                 "Press SPACE to start the next target. ESC to stop."
@@ -660,7 +586,6 @@ def run_task(fname: str) -> None:
             left_prob = 0.5
             right_prob = 0.5
             rest_prob = 0.0
-            latest_pred_code = None
             live_note = "settling"
             _settle_before_trial()
 
@@ -682,28 +607,30 @@ def run_task(fname: str) -> None:
                 dt = float(np.clip(now_t - last_frame_t, 1e-4, 0.05))
                 last_frame_t = now_t
 
-                if latest_pred_code == int(stim_cfg.left_code):
-                    proposed_pos = cursor_pos + np.array([-float(task_cfg.forward_speed_norm_s) * dt, 0.0], dtype=np.float64)
-                elif latest_pred_code == int(stim_cfg.right_code):
-                    proposed_pos = cursor_pos + np.array([float(task_cfg.forward_speed_norm_s) * dt, 0.0], dtype=np.float64)
+                command_drive = _apply_deadband(ema_command, float(task_cfg.command_deadband))
+                if task_cfg.steering_time_constant_s <= 1e-6:
+                    steering_state = command_drive
                 else:
-                    proposed_pos = cursor_pos.copy()
-                clamped_pos = np.array(
-                    [
-                        np.clip(proposed_pos[0], -arena_limit_x, arena_limit_x),
-                        0.0,
-                    ],
-                    dtype=np.float64,
-                )
-                path_length += float(np.linalg.norm(clamped_pos - cursor_pos))
-                cursor_pos[:] = clamped_pos
-                _update_cursor_visual()
+                    blend = float(np.clip(dt / task_cfg.steering_time_constant_s, 0.0, 1.0))
+                    steering_state += (command_drive - steering_state) * blend
 
-                mean_abs_command_sum += abs(raw_command)
+                turn_rate_rad_s = task_cfg.max_turn_rate_deg_s
+                heading_rad = _wrap_angle(
+                    heading_rad + math.radians(turn_rate_rad_s) * steering_state * dt
+                )
+
+                # heading_line.ori = math.degrees(heading_rad)
+
+                _update_knob_visual()
+
+                mean_abs_command_sum += abs(command_drive)
                 mean_raw_command_sum += raw_command
                 command_samples += 1
 
-                distance_to_target = float(np.linalg.norm(cursor_pos - target_pos))
+                target_center = (target_pos[0] + target_pos[1]) / 2.0
+                angular_dist_to_center = abs((heading_rad - target_center + math.pi) % (2 * math.pi) - math.pi)
+                target_region_reached = angular_dist_to_center <= task_cfg.knob_radius
+
                 cue.text = f"Trial {completed_trials + 1}"
                 parts = [
                     f"{label_cfg.left_name}: {left_prob:.2f}",
@@ -712,21 +639,22 @@ def run_task(fname: str) -> None:
                 if int(task_cfg.rest_class_code) in class_index:
                     parts.append(f"{label_cfg.rest_name}: {rest_prob:.2f}")
                 parts.extend([
-                    f"pred={latest_pred_code}",
                     f"raw={raw_command:+.2f}",
+                    f"ema={ema_command:+.2f}",
                     f"bias={bias_offset:+.2f}",
+                    f"steer={steering_state:+.2f}",
                 ])
                 info.text = "   ".join(parts)
                 status.text = (
                     f"time={trial_clock.getTime():.1f}s   "
-                    f"distance={distance_to_target:.2f}   "
+                    f"distance={angular_dist_to_center:.2f}   "
                     f"updates={prediction_count - trial_pred_start}   {live_note}"
                 )
                 _draw_frame()
 
-                if distance_to_target <= float(task_cfg.cursor_radius + task_cfg.target_radius):
+                if target_region_reached:
                     completed_trials += 1
-                    target.fillColor = success_color
+                    target_region.fillColor = success_color
                     trial_duration = float(trial_clock.getTime())
                     result = {
                         "trial": int(completed_trials),
@@ -760,9 +688,9 @@ def run_task(fname: str) -> None:
         logger.info("Session interrupted by user.")
     finally:
         if classifier is not None and trial_results:
-            with open(f"{fname}_lr_cursor_trials.pkl", "wb") as fh:
+            with open(f"{fname}_mi_cursor_trials.pkl", "wb") as fh:
                 pickle.dump(trial_results, fh)
-            logger.info("Saved %d completed trials to %s_lr_cursor_trials.pkl", len(trial_results), fname)
+            logger.info("Saved %d completed trials to %s_mi_cursor_trials.pkl", len(trial_results), fname)
         try:
             stream.disconnect()
         except Exception:
